@@ -9,13 +9,15 @@ declare(strict_types=1);
 
 use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
+use Illuminate\Testing\TestResponse;
 use Marque\Bloodhound\Models\AnnounceLog;
+use Marque\Bloodhound\Services\AntiCheatService;
 use Marque\Bloodhound\Tests\TestCase;
 use Marque\Bloodhound\Tests\TestUser;
 use Marque\Threepio\Http\Middleware\BlockBrowsers;
 use Marque\Trove\Models\Torrent;
 
-function announceGet(TestCase $test, string $url): \Illuminate\Testing\TestResponse
+function announceGet(TestCase $test, string $url): TestResponse
 {
     return $test->withoutMiddleware(BlockBrowsers::class)
         ->withHeaders(['User-Agent' => 'qBittorrent/4.5.0'])
@@ -62,7 +64,15 @@ function announceUrl(TestUser $user, Torrent $torrent, array $params = []): stri
     return "/announce/{$user->announce_key}?{$query}";
 }
 
-describe('announce log disabled (the default)', function () {
+// Spec #99 (CP1) inverted the default to enabled — the ledger is the source of
+// truth for ratio and cannot be opt-in. Turning it off is still supported, and
+// still has to actually turn it off, so these set the config explicitly rather
+// than leaning on whatever the default happens to be.
+describe('announce log explicitly disabled', function () {
+    beforeEach(function () {
+        config(['bloodhound.announce_log.enabled' => false]);
+    });
+
     it('dispatches no LogAnnounce job at all', function () {
         Queue::fake();
 
@@ -80,7 +90,7 @@ describe('announce log disabled (the default)', function () {
     });
 });
 
-describe('announce log enabled', function () {
+describe('announce log enabled (the default)', function () {
     beforeEach(function () {
         config(['bloodhound.announce_log.enabled' => true]);
         config(['bloodhound.queue.enabled' => false]); // dispatchSync-equivalent for the test
@@ -189,7 +199,7 @@ describe('the existing Redis suspicious list', function () {
             'left' => 0,
         ]));
 
-        $antiCheat = app(\Marque\Bloodhound\Services\AntiCheatService::class);
+        $antiCheat = app(AntiCheatService::class);
         $suspicious = $antiCheat->getSuspiciousActivity();
 
         expect($suspicious)->not->toBeEmpty();

@@ -4,11 +4,9 @@ declare(strict_types=1);
 
 namespace Marque\Bloodhound\Services;
 
-use Illuminate\Contracts\Bus\Dispatcher;
 use Illuminate\Http\Response;
 use Marque\Bloodhound\Events\TorrentCompleted;
-use Marque\Bloodhound\Jobs\LogAnnounce;
-use Marque\Bloodhound\Jobs\UpdateUserStats;
+use Marque\Bloodhound\Models\AnnounceLog;
 use Marque\Threepio\Enums\AnnounceEvent;
 use Marque\Threepio\Services\PeerService;
 use Marque\Threepio\Support\TrackerResponse;
@@ -147,11 +145,19 @@ final class AnnounceService
             antiCheatCheck: $antiCheatCheck,
         );
 
+        // The stopped path is where a torrent actually goes dead, so the
+        // projection matters most here — this is the decrement the old
+        // `visible` flag never had.
+        $seeders = $this->peerService->getSeeders($torrent->id);
+        $leechers = $this->peerService->getLeechers($torrent->id);
+
+        $this->syncSwarmCounts($torrent, $seeders, $leechers);
+
         // Even on stopped, return a valid response
         return TrackerResponse::announce(
             peers: [],
-            complete: $this->peerService->getSeeders($torrent->id),
-            incomplete: $this->peerService->getLeechers($torrent->id),
+            complete: $seeders,
+            incomplete: $leechers,
             interval: (int) config('threepio.announce_interval', 1800),
             minInterval: (int) config('threepio.min_announce_interval', 300),
             compact: true,
@@ -184,8 +190,9 @@ final class AnnounceService
             userAgent: $userAgent,
         ));
 
-        // Update the torrent's completion count
-        $torrent->increment('times_completed');
+        // The torrent's completion count is bumped by RecordCompletion,
+        // which only counts a completion the user's own row counted — so a
+        // client restarting mid-download no longer inflates it. See Spec #99.
 
         // Process as a regular announce, but logged as 'completed' — not
         // delegated silently, or the announce_log row would say 'regular'
@@ -245,21 +252,15 @@ final class AnnounceService
             uploadDelta: $result['upload_delta'],
             downloadDelta: $result['download_delta'],
             antiCheatCheck: $antiCheatCheck,
+            priorUp: $result['prior_up'],
+            priorDown: $result['prior_down'],
         );
 
-        // Queue user stats update if there are deltas
-        if ($result['upload_delta'] > 0 || $result['download_delta'] > 0) {
-            $this->queueStatsUpdate(
-                userId: $user->getAuthIdentifier(),
-                uploadDelta: $result['upload_delta'],
-                downloadDelta: $result['download_delta'],
-            );
-        }
-
-        // Update torrent visibility if seeder
-        if ($isSeeder && ! $torrent->visible) {
-            $torrent->update(['visible' => true]);
-        }
+        // No stats dispatch here any more. The deltas were just written to
+        // the ledger above, and bloodhound:aggregate-ledger folds them into
+        // user and per-torrent totals from there. Sending them through a queue
+        // as well would put a second, losable copy of the same number in
+        // flight — which is the failure this design removes. See Spec #99.
 
         // Get peers for response
         $maxPeers = min($numWant, (int) config('threepio.max_peers_per_announce', 50));
@@ -273,10 +274,19 @@ final class AnnounceService
         // Determine response format
         $useCompact = $this->shouldUseCompact($compact);
 
+        // The response needs these anyway, so projecting them onto the torrent
+        // costs nothing extra. Redis stays the source of truth for live peers;
+        // the columns exist so the catalogue can filter and sort on swarm
+        // state, which it cannot do against Redis.
+        $seeders = $this->peerService->getSeeders($torrent->id);
+        $leechers = $this->peerService->getLeechers($torrent->id);
+
+        $this->syncSwarmCounts($torrent, $seeders, $leechers);
+
         return TrackerResponse::announce(
             peers: $peers,
-            complete: $this->peerService->getSeeders($torrent->id),
-            incomplete: $this->peerService->getLeechers($torrent->id),
+            complete: $seeders,
+            incomplete: $leechers,
             interval: (int) config('threepio.announce_interval', 1800),
             minInterval: (int) config('threepio.min_announce_interval', 300),
             compact: $useCompact,
@@ -284,18 +294,23 @@ final class AnnounceService
     }
 
     /**
-     * Queue a stats update for the user.
+     * Project the live swarm counts onto the torrent row.
+     *
+     * Skips the write when nothing changed — announces arrive every few
+     * minutes per peer and the counts are stable most of the time, so an
+     * unconditional update would add a pointless write to the hottest path in
+     * the tracker.
      */
-    private function queueStatsUpdate(int $userId, int $uploadDelta, int $downloadDelta): void
+    private function syncSwarmCounts(Torrent $torrent, int $seeders, int $leechers): void
     {
-        if (config('bloodhound.queue.enabled', true)) {
-            UpdateUserStats::dispatch($userId, $uploadDelta, $downloadDelta)
-                ->onConnection(config('bloodhound.queue.connection'))
-                ->onQueue(config('bloodhound.queue.queue', 'tracker'));
-        } else {
-            // Immediate update if queue disabled
-            UpdateUserStats::dispatchSync($userId, $uploadDelta, $downloadDelta);
+        if ($torrent->seeders === $seeders && $torrent->leechers === $leechers) {
+            return;
         }
+
+        $torrent->forceFill([
+            'seeders' => $seeders,
+            'leechers' => $leechers,
+        ])->save();
     }
 
     /**
@@ -309,8 +324,12 @@ final class AnnounceService
     }
 
     /**
-     * Dispatch a LogAnnounce job (Spec #98), only when the feature is on —
-     * no dispatch call at all when disabled, not a job that no-ops.
+     * Write the ledger row for this announce (Spec #99).
+     *
+     * Synchronous and inline: this is the durable record the tracker's whole
+     * accounting is rebuilt from, so it must exist before the response does.
+     * Was a queued job under Spec #98, when the table was an optional
+     * investigative log rather than the source of truth.
      */
     private function logAnnounce(
         UserInterface $user,
@@ -326,38 +345,42 @@ final class AnnounceService
         int $uploadDelta,
         int $downloadDelta,
         array $antiCheatCheck,
+        ?int $priorUp = null,
+        ?int $priorDown = null,
     ): void {
-        if (! config('bloodhound.announce_log.enabled', false)) {
+        if (! config('bloodhound.announce_log.enabled', true)) {
             return;
         }
 
-        $job = new LogAnnounce(
-            userId: $user->getAuthIdentifier(),
-            torrentId: $torrent->id,
-            peerId: $peerId,
-            event: $eventLabel,
-            ip: $ip,
-            port: $port,
-            userAgent: $userAgent,
-            uploaded: $uploaded,
-            downloaded: $downloaded,
-            left: $left,
-            uploadDelta: $uploadDelta,
-            downloadDelta: $downloadDelta,
-            antiCheatFlagged: ! $antiCheatCheck['passed'],
-            antiCheatReason: $antiCheatCheck['reason'] ?? null,
-        );
-
-        // Same queue-or-sync choice as queueStatsUpdate() — reuses
-        // bloodhound.queue.*, not a second queue config for this feature.
-        if (config('bloodhound.queue.enabled', true)) {
-            app(Dispatcher::class)->dispatch(
-                $job->onConnection(config('bloodhound.queue.connection'))
-                    ->onQueue(config('bloodhound.queue.queue', 'tracker'))
-            );
-        } else {
-            app(Dispatcher::class)->dispatchSync($job);
-        }
+        // Written synchronously, before the response goes back to the client.
+        //
+        // This row is the durable record of what the tracker credited, and
+        // everything else — user totals, per-torrent totals, the reconciliation
+        // that proves them right — is a projection rebuilt from it. Dispatching
+        // it to a queue would mean the only copy of a byte count lived in a job
+        // payload, and a lost job would be a lost credit with nothing left to
+        // re-derive it from. See Spec #99.
+        //
+        // The cost is one insert on the announce path, which at tracker volumes
+        // is a fraction of the request. That is the trade, made deliberately.
+        AnnounceLog::create([
+            'user_id' => $user->getAuthIdentifier(),
+            'torrent_id' => $torrent->id,
+            'peer_id' => $peerId,
+            'event' => $eventLabel,
+            'ip' => $ip,
+            'port' => $port,
+            'user_agent' => $userAgent,
+            'uploaded' => $uploaded,
+            'downloaded' => $downloaded,
+            'left' => $left,
+            'upload_delta' => $uploadDelta,
+            'download_delta' => $downloadDelta,
+            'prior_up' => $priorUp,
+            'prior_down' => $priorDown,
+            'anti_cheat_flagged' => ! $antiCheatCheck['passed'],
+            'anti_cheat_reason' => $antiCheatCheck['reason'] ?? null,
+        ]);
     }
 
     /**

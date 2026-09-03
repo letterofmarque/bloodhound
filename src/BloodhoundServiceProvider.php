@@ -7,14 +7,21 @@ namespace Marque\Bloodhound;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Schedule;
 use Illuminate\Support\ServiceProvider;
+use Marque\Bloodhound\Console\Commands\AggregateLedger;
+use Marque\Bloodhound\Console\Commands\AuditLedger;
 use Marque\Bloodhound\Console\Commands\PruneAnnounceLog;
+use Marque\Bloodhound\Console\Commands\RebuildTotals;
+use Marque\Bloodhound\Console\Commands\ReconcileLedger;
+use Marque\Bloodhound\Console\Commands\SyncSwarmCounts;
 use Marque\Bloodhound\Contracts\AnnounceLogServiceInterface;
 use Marque\Bloodhound\Events\TorrentCompleted;
-use Marque\Bloodhound\Listeners\RecordSnatch;
-use Marque\Bloodhound\Services\AntiCheatService;
+use Marque\Bloodhound\Listeners\RecordCompletion;
+use Marque\Bloodhound\Models\AnnounceLog;
 use Marque\Bloodhound\Services\AnnounceLogService;
 use Marque\Bloodhound\Services\AnnounceService;
+use Marque\Bloodhound\Services\AntiCheatService;
 use Marque\Bloodhound\Services\ClientValidationService;
+use Marque\Threepio\Services\PeerService;
 
 class BloodhoundServiceProvider extends ServiceProvider
 {
@@ -31,6 +38,54 @@ class BloodhoundServiceProvider extends ServiceProvider
         // pattern) so a consumer can swap the query implementation — e.g. to
         // read the log from a warehouse rather than the table itself.
         $this->app->bind(AnnounceLogServiceInterface::class, AnnounceLogService::class);
+
+        // Teach threepio's peer store to recover a lost baseline from the
+        // ledger (Spec #99 CP3).
+        //
+        // threepio cannot do this itself: bloodhound depends on threepio, so
+        // threepio has no access to announce_log and no notion of a durable
+        // record. It exposes the seam; the private tracker fills it. hound
+        // leaves it unfilled and keeps the old behaviour, which is right —
+        // a public tracker has no ledger and nothing to recover from.
+        $this->app->extend(PeerService::class, function (PeerService $peers) {
+            $peers->resolveBaselineUsing($this->recoverBaselineFromLedger(...));
+
+            return $peers;
+        });
+    }
+
+    /**
+     * Recover a peer's last known cumulative counters from the ledger.
+     *
+     * Called only when Redis has no record of the peer, so this is the outage
+     * path, not the hot path — a warm session never reaches it. Scoped to the
+     * exact (torrent, peer) pair: a different peer_id is a different client
+     * session with its own counters starting from zero, and a different
+     * torrent is unrelated entirely. Inheriting either one's baseline would be
+     * worse than having none.
+     *
+     * @return array{uploaded: int, downloaded: int}|null
+     */
+    protected function recoverBaselineFromLedger(int $torrentId, string $peerId): ?array
+    {
+        if (! config('bloodhound.announce_log.enabled', true)) {
+            return null;
+        }
+
+        $last = AnnounceLog::query()
+            ->where('torrent_id', $torrentId)
+            ->where('peer_id', $peerId)
+            ->orderByDesc('id')
+            ->first();
+
+        if ($last === null) {
+            return null;
+        }
+
+        return [
+            'uploaded' => $last->uploaded,
+            'downloaded' => $last->downloaded,
+        ];
     }
 
     public function boot(): void
@@ -57,7 +112,7 @@ class BloodhoundServiceProvider extends ServiceProvider
      */
     protected function registerEventListeners(): void
     {
-        Event::listen(TorrentCompleted::class, RecordSnatch::class);
+        Event::listen(TorrentCompleted::class, RecordCompletion::class);
     }
 
     /**
@@ -77,9 +132,31 @@ class BloodhoundServiceProvider extends ServiceProvider
         }
 
         $this->commands([
+            AggregateLedger::class,
+            AuditLedger::class,
             PruneAnnounceLog::class,
+            RebuildTotals::class,
+            ReconcileLedger::class,
+            SyncSwarmCounts::class,
         ]);
 
+        // Every minute. This is the fallback that makes the queue optional
+        // rather than load-bearing: even if every queued job were lost, this
+        // tick folds the ledger and the totals catch up. Cheap when there is
+        // nothing pending — one indexed lookup against the cursor.
+        Schedule::command('bloodhound:aggregate-ledger')->everyMinute()->withoutOverlapping();
+
         Schedule::command('bloodhound:prune-announce-log')->daily();
+
+        // Hourly, not daily: this corrects torrents whose peers expired without
+        // a stopped announce, and until it runs they show a swarm they no
+        // longer have. A day of that is a catalogue full of torrents claiming
+        // seeders that left yesterday.
+        Schedule::command('bloodhound:sync-swarm-counts')->hourly();
+
+        // Daily. This is the mechanism that turns a wrong number from
+        // permanent-and-invisible into something an operator is told about,
+        // so it runs unconditionally rather than being something to enable.
+        Schedule::command('bloodhound:reconcile-ledger')->daily();
     }
 }

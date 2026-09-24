@@ -11,7 +11,65 @@ return [
     | Settings specific to the private tracker. Shared protocol settings
     | (announce intervals, peer storage, ports) live in threepio config.
     |
+    | REQUIRES REDIS. Peer storage is a real Redis server, not Laravel's cache
+    | pointed at one — PeerService uses sets, hashes and atomic counters, none
+    | of which the cache abstraction offers. Without a working connection the
+    | announce path fatals on the first request. You need ext-redis or
+    | predis/predis installed; see packages/threepio/README.md.
+    |
+    | Note the failure mode if Redis restarts empty: it holds the baseline
+    | announce deltas are diffed against, so the next announce credits zero
+    | silently. The announce ledger below is what recovers from that.
+    |
     */
+
+    /*
+    |--------------------------------------------------------------------------
+    | Announce Routing
+    |--------------------------------------------------------------------------
+    |
+    | The shape of your announce and scrape URLs. These exist because a tracker
+    | migrating onto Marque cannot change its announce URL: every .torrent
+    | already in circulation announces to the old one, and those files are on
+    | strangers' disks. They cannot be reissued.
+    |
+    | So this is "your URLs, your choice" — not a legacy compatibility mode.
+    | There are no per-tracker special cases here and there should never be.
+    |
+    | 'announce_path'  Path segment, no leading slash. 'announce.php' is fine.
+    | 'scrape_path'    Same, for scrape. Change both or you half-migrate.
+    | 'key_source'     'path' (/announce/<key>) or 'query' (?passkey=<key>).
+    | 'key_parameter'  Route segment name, or query parameter name. TBDev and
+    |                  Gazelle-derived trackers use 'passkey'.
+    | 'key_pattern'    Regex (no delimiters) the key must match. ONE source of
+    |                  truth — the route constraint and the controllers all
+    |                  read this, so they cannot drift apart.
+    |
+    | On key_pattern and security: this gates what reaches a database lookup.
+    | The default matches what bloodhound itself mints (Str::random(32), i.e.
+    | 32 alphanumeric chars). Widening it is your risk to take — keep it as
+    | tight as your existing keys allow, and anchor nothing yourself; the
+    | pattern is anchored for you.
+    |
+    | On key_source and error surfaces: with the key in the path, a malformed
+    | key is a 404 from the router and never reaches PHP. As a query parameter
+    | every request reaches the controller, which answers a malformed key with
+    | a bencoded 'failure reason' and HTTP 200 — the same shape as every other
+    | tracker error, because that is what BitTorrent clients expect. Trackers
+    | are probed constantly; know which of the two you are running.
+    |
+    | Route NAMES never change: 'tracker.announce' and 'tracker.scrape'
+    | whatever you set here, so route() calls keep working.
+    |
+    */
+
+    'routes' => [
+        'announce_path' => env('BLOODHOUND_ANNOUNCE_PATH', 'announce'),
+        'scrape_path' => env('BLOODHOUND_SCRAPE_PATH', 'scrape'),
+        'key_source' => env('BLOODHOUND_KEY_SOURCE', 'path'),
+        'key_parameter' => env('BLOODHOUND_KEY_PARAMETER', 'announce_key'),
+        'key_pattern' => env('BLOODHOUND_KEY_PATTERN', '[0-9a-zA-Z]{32}'),
+    ],
 
     /*
     |--------------------------------------------------------------------------

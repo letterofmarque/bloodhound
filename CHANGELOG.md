@@ -7,6 +7,24 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [6.1.0] — 2026-10-03
+
+> Security: banned and disabled users can no longer announce, and an app that verifies email addresses issues announce keys on verification instead of at sign-up.
+
+### Security
+
+- **An announce key was issued to every new user, verified or not.** If the app's
+  `User` implements `MustVerifyEmail`, `HasTrackerStats` now holds the key back from
+  an unverified user and issues it when Laravel's `Verified` event fires. A user who
+  already has a key keeps it, so nobody has to re-download their `.torrent` files.
+  Not retroactive: unverified users who already hold a key keep it.
+- **Banned and disabled users could keep announcing.** The announce check asked
+  `property_exists()` about `enabled` and `status`, which is always false for an
+  Eloquent attribute, so every user counted as enabled. It now reads the
+  attributes. An `enabled` column set to false refuses, as do the statuses
+  `banned`, `disabled` and `pending`, which are the same set usarrs refuses. Any
+  other status value is left alone.
+
 ## [6.0.0] — 2026-09-25
 
 > Announce keys move into a table bloodhound owns and other packages read tracker figures through a declared contract; the announce URL's shape also becomes configurable for migrating trackers.

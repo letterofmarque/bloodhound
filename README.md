@@ -134,10 +134,10 @@ key formats are disjoint first.
 
 1. Announce key validated, user looked up
 2. Torrent identified by info_hash
-3. Anti-cheat checks run
-4. Client validated against whitelist
+3. Client validated against whitelist
+4. Anti-cheat checks run
 5. Peer upserted in Redis, stats calculated
-6. Upload/download deltas queued for database update
+6. Upload/download deltas written to the announce ledger; totals are folded in by `bloodhound:aggregate-ledger`
 7. Bencoded peer list returned to client
 
 ### Peer Storage
@@ -186,6 +186,10 @@ Covered in full under [Announce URL shape](#announce-url-shape) above.
 
 ### Timing
 
+Timing, Redis and the peer response are threepio's settings, in `config/threepio.php`
+(env vars `THREEPIO_*`). bloodhound keeps its peers through threepio, so it uses them;
+publish threepio's config to change them.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `announce_interval` | `1800` | Seconds between announces (sent to clients) |
@@ -194,12 +198,16 @@ Covered in full under [Announce URL shape](#announce-url-shape) above.
 
 ### Redis
 
+From `config/threepio.php`, as above.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `redis.connection` | `default` | Laravel Redis connection name |
-| `redis.prefix` | `bloodhound:` | Key namespace |
+| `redis.prefix` | `marque:` | Key namespace |
 
 ### Peer Response
+
+From `config/threepio.php`, as above.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -208,14 +216,14 @@ Covered in full under [Announce URL shape](#announce-url-shape) above.
 
 ### Client Validation
 
-Bloodhound validates BitTorrent clients by peer ID. Default mode is `whitelist` with 17 pre-configured clients including qBittorrent, Deluge, Transmission, rTorrent, libtorrent, Vuze, and others.
+Bloodhound validates BitTorrent clients by peer ID. Default mode is `whitelist` with 9 pre-configured clients: qBittorrent, Deluge, Transmission, libtorrent, rTorrent, uTorrent, BitTorrent, Vuze and BiglyBT.
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `client_validation.enabled` | `true` | Enable client checks |
 | `client_validation.mode` | `whitelist` | `whitelist` or `blacklist` |
-| `client_validation.whitelist` | *(see config)* | Allowed clients with version ranges |
-| `client_validation.blacklist` | *(see config)* | Blocked clients (Xunlei, etc.) |
+| `whitelist` | *(see config)* | Allowed clients with version ranges, a top-level key |
+| `blacklist` | *(see config)* | Blocked clients (Xunlei, etc.), a top-level key |
 
 Each whitelist entry specifies a peer ID pattern, version format, and allowed version range. You can add custom clients or adjust version requirements.
 
@@ -245,9 +253,9 @@ Violations fire a `CheatDetected` event and are logged to Redis for admin review
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `queue.enabled` | `true` | **No longer read** |
-| `queue.connection` | `null` | **No longer read** |
-| `queue.queue` | `tracker` | **No longer read** |
+| `queue.enabled` | `true` | **No longer read** <!-- check-docs: ignore — retired by the ledger, removed at the next major (#10816) --> |
+| `queue.connection` | `null` | **No longer read** <!-- check-docs: ignore — retired by the ledger, removed at the next major (#10816) --> |
+| `queue.queue` | `tracker` | **No longer read** <!-- check-docs: ignore — retired by the ledger, removed at the next major (#10816) --> |
 
 Byte counts no longer travel through a queue. They are written to the ledger on the
 announce path and folded into totals by `bloodhound:aggregate-ledger`. These keys are
@@ -277,11 +285,9 @@ people banned.
 Turning it off is supported, but it disables reconciliation, the rebuild command, and the
 arithmetic audit along with it. You are choosing to accumulate numbers nothing can verify.
 
-Turn this on if you want to investigate a cheating report or settle a disputed ratio after the fact. It is off by default because full-detail logging on a busy tracker is real, ongoing storage growth, and that shouldn't be imposed on every install.
-
 | Key | Default | Description |
 |-----|---------|-------------|
-| `announce_log.enabled` | `false` | Master switch |
+| `announce_log.enabled` | `true` | Master switch |
 | `announce_log.connection` | `null` | Database connection (null = app default) |
 | `announce_log.retention_days` | `null` | Days to keep rows (null = forever) |
 
@@ -321,7 +327,7 @@ This is the mechanism for keeping a high-write-volume table off your main databa
 
 #### Retention and pruning
 
-`retention_days` is `null` by default, which means **keep everything forever**. With logging enabled and no retention set, this table grows without bound on a busy tracker. That default is deliberate - once you've opted into logging, how long to keep it is your call, not ours - but it is your job to make it.
+`retention_days` is `null` by default, which means **keep everything forever**. With logging on (the default) and no retention set, this table grows without bound on a busy tracker. That default is deliberate - how long to keep the source of truth for ratio is your call, not ours - but it is your job to make it.
 
 Set `retention_days` and the scheduled `bloodhound:prune-announce-log` command keeps the table bounded:
 
@@ -335,7 +341,7 @@ It's registered on Laravel's scheduler to run daily, so it needs [the scheduler 
 
 This is a Bloodhound feature and has no equivalent in [marque/hound](https://packagist.org/packages/marque/hound). Public trackers are deliberately anonymous - `hound` records no user against an announce at all - so ratio verification and cheat investigation aren't concepts that apply there.
 
-The existing anti-cheat Redis `suspicious` list keeps working exactly as before whether or not you enable this, since it has no toggle of its own and operators who haven't opted in still need it.
+The existing anti-cheat Redis `suspicious` list keeps working exactly as before whether or not you enable this, since it has no toggle of its own and operators who turn the log off still need it.
 
 #### Querying the log
 
@@ -370,7 +376,7 @@ Bloodhound ships no UI for this. Browsing the log is left to your application.
 
 ### Verifying the numbers
 
-Three commands, and the reason they exist: before the ledger, a byte count could be lost
+Four commands, and the reason they exist: before the ledger, a byte count could be lost
 or corrupted and **nothing anywhere would know**. The totals were accumulators with
 nothing behind them, so a wrong number stayed wrong forever and the first anyone heard of
 it was a user disputing a ban.

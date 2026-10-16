@@ -361,6 +361,12 @@ php artisan bloodhound:prune-announce-log
 
 It's registered on Laravel's scheduler to run daily, so it needs [the scheduler running](https://laravel.com/docs/scheduling#running-the-scheduler). It no-ops safely when no retention is configured, and reports what it did either way.
 
+**Pruning does not lose credit.** The rows it deletes produced totals people are held to,
+so before deleting them it moves what they produced into `ledger_carry`, one row per
+user and torrent, in the same transaction as the delete. The ledger is its rows plus its
+carry, and reconciliation and `rebuild-totals` read it that way, so both stay exact after
+a prune. See [Pruning and the floor](#pruning-and-the-floor).
+
 #### Private trackers only
 
 This is a Bloodhound feature and has no equivalent in [marque/hound](https://packagist.org/packages/marque/hound). Public trackers are deliberately anonymous - `hound` records no user against an announce at all - so ratio verification and cheat investigation aren't concepts that apply there.
@@ -398,18 +404,79 @@ Results aren't paginated. The log is queried deliberately - an investigation, a 
 
 Bloodhound ships no UI for this. Browsing the log is left to your application.
 
+### Seedtime and leechtime
+
+Bloodhound measures how long each member spent seeding and leeching every torrent, on the
+member (`seedtime`, `leechtime`) and per torrent (`torrent_user.seedtime`,
+`torrent_user.leechtime`), in seconds. Both are derived from the announce log, so they are
+checked by reconciliation and recomputed by `rebuild-totals` like the byte totals.
+
+How a peer's time is counted, from the gap between two of its consecutive announces:
+
+- **The peer's state at the start of the gap decides which it was.** Bytes left to
+  download means leeching; nothing left means seeding. The gap in which a peer finishes
+  downloading counts as leeching, all of it, because that is what it was doing.
+- **A gap counts up to `threepio.peer_expiry` (an hour by default), no more.** A client
+  that goes quiet without saying so gets the hour, the point at which the swarm already
+  treats it as gone, rather than the whole night its laptop was shut.
+- **A `stopped` announce ends the session.** The peer said it was leaving, so nothing is
+  counted from it to the peer's next announce.
+- **Time is counted in every `ratio_mode`.** It is a record of what happened, not a
+  policy; switching mode later finds the history already there.
+- **hound counts nothing.** A public tracker has no members to credit.
+
+**Expect lower figures than some other trackers report.** Trackers that credit a fixed
+announce interval per announce, or the whole gap however long, count time a client
+wasn't there. Bloodhound counts only time it can stand behind: real elapsed time between
+announces, capped, and never across a stop.
+
+### Aggregation throughput, and its limits
+
+Every announce now changes a total. Before seedtime, an announce that moved no bytes (most
+of them: idle seeders reporting in) changed nothing and cost the aggregator nothing. Now
+every announce earns seeding or leeching time, so for every batch the aggregator:
+
+- looks up each peer's previous announce (one index seek per peer), to measure the gap;
+- writes every member and every member-and-torrent total the batch touched.
+
+Each batch of 1,000 announces is folded in a fixed handful of statements, but the database
+still does that work per announce. Measured on a development machine, aggregating 200,000
+announces (500 members, 300 torrents, 2,000 peers):
+
+| Engine | Seconds | Announces per second | Before seedtime |
+|---|---|---|---|
+| SQLite | 15.5 | ~12,900 | 10.9s |
+| MariaDB | 25.3 | ~7,900 | 23.4s |
+| MySQL | 39.5 | ~5,100 | 27.1s |
+| PostgreSQL | 51.3 | ~3,900 | 30.5s |
+
+On PostgreSQL most of the time is writing the updated rows; on MySQL, the look-ups. Your
+hardware will give different numbers; the shape will hold.
+
+**What this means for you:** the aggregator runs every minute and must keep up with your
+peak announce rate, not your average. If it falls behind, ratios and seedtime update late
+but nothing is lost: the announce log is the record and the aggregator catches up.
+`bloodhound:reconcile-ledger` reports how many announces are waiting, so watch that number
+at your busiest hour.
+
+**An alternative design is being considered** that would cut the per-announce cost,
+probably by keeping a small record of each peer's last announce or by folding time on its
+own, slower schedule. Neither is decided or promised; this section will say when that
+changes.
+
 ### Verifying the numbers
 
-Four commands, and the reason they exist: before the ledger, a byte count could be lost
+The commands, and the reason they exist: before the ledger, a byte count could be lost
 or corrupted and **nothing anywhere would know**. The totals were accumulators with
 nothing behind them, so a wrong number stayed wrong forever and the first anyone heard of
 it was a user disputing a ban.
 
 ```bash
-php artisan bloodhound:aggregate-ledger    # fold pending rows into totals (scheduled, every minute)
-php artisan bloodhound:reconcile-ledger    # do the totals match the ledger? (scheduled, daily)
-php artisan bloodhound:audit-ledger        # is the ledger itself coherent?
-php artisan bloodhound:rebuild-totals      # recompute totals from the ledger
+php artisan bloodhound:aggregate-ledger        # fold pending rows into totals (scheduled, every minute)
+php artisan bloodhound:reconcile-ledger        # do the totals match the ledger? (scheduled, daily)
+php artisan bloodhound:audit-ledger            # is the ledger itself coherent?
+php artisan bloodhound:rebuild-totals          # recompute totals from the ledger
+php artisan bloodhound:record-pruned-history   # one-off: account for rows an older version pruned
 ```
 
 **Reconciliation reports; it does not repair.** You should learn a number went wrong
@@ -423,17 +490,42 @@ means a baseline went missing between two announces — which is what a Redis ou
 like after the fact. Those bytes were never credited and cannot be recovered, but you
 find out it happened instead of never knowing.
 
-**Rebuild** recomputes user and per-torrent totals by replaying the ledger, for everyone
-or `--user=`. It deliberately does not move the aggregation watermark, and it restores
-byte columns only — completion dates are not derivable from deltas.
+**Rebuild** recomputes user and per-torrent totals by replaying the ledger and its carry,
+for everyone or `--user=`: bytes, and seedtime and leechtime. It deliberately does not
+move the aggregation watermark, and it leaves completion dates and counts alone, because
+they are not derivable from the rows.
 
 ### Pruning and the floor
 
 `bloodhound:prune-announce-log` deletes rows past `retention_days`, but **only rows the
-aggregator has already consumed**. Age alone is not sufficient grounds for deletion:
-pruning below the reconciliation watermark would make the totals derived from those rows
-permanently unverifiable, which is a cleanup job quietly destroying the thing the ledger
-exists to protect. The command says so when it withholds rows.
+aggregator has already consumed**. Rows still waiting to be aggregated are kept whatever
+their age, because nothing has credited them yet. The command says so when it withholds
+rows.
+
+**What it deletes, it carries forward.** In one transaction per slice of users, the prune
+works out what those users' rows produce (bytes, and the seedtime and leechtime derived
+from them) before the delete and again after, and adds the difference to `ledger_carry`.
+It has to be the difference, not the deleted rows' own share: an interval is credited on
+the announce that closes it, so a surviving announce whose earlier partner is pruned would
+otherwise lose its interval. If anything fails, the delete rolls back with the carry;
+neither lands alone.
+
+**Each peer's latest aggregated announce is kept**, whatever its age, unless it is a
+`stopped`. Time is credited on the announce that closes an interval, so deleting a peer's
+last announce would leave its next one, still waiting to be aggregated or sent weeks
+later, with nothing to pair with, and that time would be lost without anything reporting
+it. Peers whose session ended with a stop keep nothing, which is most of them. So
+retention bounds the table to your retention window plus about one row per session that
+ended without a stop (a crash, a lost connection, a laptop shut), not to zero.
+
+Carry values are signed. If a clock ever stepped back, a pruned row can sit between two
+surviving rows in id order while being older than both. Deleting it pairs the survivors
+directly, which can credit more than before, and the carry for that is negative.
+
+Before this, a prune kept nothing. Reconciliation then reported every pruned user as
+drift, and the `rebuild-totals` it recommended replayed only the surviving rows,
+**cutting real users' ratios**. If you pruned on an earlier version, see
+[Upgrading an existing install](#upgrading-an-existing-install).
 
 ### Upgrading an existing install
 
@@ -445,6 +537,47 @@ That row asserts the old total was correct **as of migration**. It is not eviden
 it ever was — the per-announce history was never kept, which is exactly why the ledger now
 exists. Per-torrent history likewise starts empty, so hit-and-run enforcement is only
 meaningful for torrents grabbed after the upgrade.
+
+#### Upgrading to seedtime
+
+Announces folded before seedtime was derived credited no time. Run this once after the
+upgrade's migrations:
+
+```bash
+php artisan bloodhound:rebuild-totals
+```
+
+It derives every member's seedtime and leechtime from the announce log, as far back as
+your retention has kept it. Until you run it, `reconcile-ledger` reports each member's
+seedtime as drift and tells you to. It is safe after pruning, because the migrations
+record earlier prunes first (below).
+
+#### If you pruned on an earlier version
+
+Before pruning carried forward, every prune deleted credited rows and kept nothing. Those
+users' totals are still right, but the ledger no longer explains them: reconciliation
+reports them as drift, and **running `rebuild-totals` would cut their ratios.** Don't run
+a rebuild until this is done.
+
+The upgrade migration fixes it if `retention_days` is set: it records each gap as carry
+and reports how many users and per-torrent totals it covered. If you pruned in the past
+but have since turned retention off, run it yourself:
+
+```bash
+php artisan bloodhound:record-pruned-history
+```
+
+It records only what pruning could have caused, so real drift stays visible:
+
+- **per user and torrent**, because every pair that moved bytes has its own total, and
+  pruned credit always leaves a gap there. A gap only on a user's own total means the
+  two totals disagree with each other, which pruning can't cause.
+- **only where the stored total is above the ledger**, because pruning removes credit and
+  never adds it.
+- **bytes only**, because seedtime was never recorded before this version.
+
+Like the opening balance, what it records asserts the totals were correct as of the
+upgrade, not that they were ever right. Running it again changes nothing.
 
 ### Port Blacklist
 
@@ -479,6 +612,17 @@ Bloodhound applies `BlockBrowsers` middleware to tracker endpoints. This rejects
 - Laravel 13+
 - Redis
 - [marque/trove](https://packagist.org/packages/marque/trove)
+- A database at or above:
+
+| Engine | Minimum | Why |
+|---|---|---|
+| MySQL | 8.0 | window functions (seedtime is measured with `LAG()`) |
+| MariaDB | 10.3 | Laravel 13's own minimum |
+| PostgreSQL | 10 | Laravel 13's own minimum |
+| SQLite | 3.33 | `UPDATE ... FROM` (the aggregator's batched writes) |
+
+Below these you get a SQL syntax error from the aggregator, not a clear refusal. Check
+`SELECT VERSION()` (or `sqlite3 --version`) before upgrading.
 
 ## License
 

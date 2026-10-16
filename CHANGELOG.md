@@ -7,6 +7,74 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [8.0.0] — 2026-10-16
+
+> Seedtime and leechtime are measured for real, and pruning the announce log no longer costs members their credit; needs MySQL 8.0, MariaDB 10.3, PostgreSQL 10 or SQLite 3.33.
+
+### Changed (breaking)
+
+- **Database minimums: MySQL 8.0, MariaDB 10.3, PostgreSQL 10, SQLite 3.33.** Seedtime is
+  measured with window functions, and the aggregator's batched writes use
+  `UPDATE ... FROM` on SQLite. Below these you get a SQL error from the aggregator, not a
+  clear refusal.
+- **Existing history needs a one-off `bloodhound:rebuild-totals`** to get its seedtime (see
+  Upgrading).
+
+### Added
+
+- **Seedtime and leechtime, derived from the announce log.** `seedtime` had always been
+  written as 0. Both are now measured per member and per torrent, from the gaps between
+  each peer's announces: attributed by the peer's state at the start of the gap (the gap in
+  which it finishes is leech time), capped at `threepio.peer_expiry`, and never counted
+  across a `stopped` announce. Counted in every `ratio_mode` (Spec #121, #10613).
+- **`leechtime`** columns on the users table and `torrent_user` (new migration; the shipped
+  users-table migrations are unchanged).
+- **Reconciliation checks seedtime and leechtime**, and `rebuild-totals` recomputes them.
+- **`ledger_carry`**: credit whose ledger rows were pruned, per user and torrent, on the
+  same connection as `announce_log`.
+- **`bloodhound:record-pruned-history`**: records credit an earlier prune deleted without
+  carrying it, for installs that pruned in the past and have since turned retention off.
+
+### Changed
+
+- **The aggregator does more work per announce.** Every announce now earns time, so every
+  batch looks up each peer's previous announce and writes every total it touched; before,
+  announces that moved no bytes cost nothing. Batches are folded in a fixed handful of
+  statements. Measured throughput and what to watch are in the README under "Aggregation
+  throughput, and its limits".
+
+### Fixed
+
+- **Pruning no longer costs members their credit.** `bloodhound:prune-announce-log` deleted
+  aggregated ledger rows and kept nothing. Reconciliation then reported every pruned member
+  as drift, and the `rebuild-totals` it recommends replayed only the surviving rows,
+  cutting real members' ratios. Every install with `retention_days` set was affected. A
+  prune now carries what it deletes into `ledger_carry` in the same transaction (bytes, and
+  the difference it makes to seedtime and leechtime), and reconciliation and rebuild read
+  the ledger as its rows plus its carry (#11021).
+- **A prune keeps each peer's latest aggregated announce** (unless it is a `stopped`), so an
+  announce still waiting to be aggregated, or sent after the retention window, keeps the
+  interval it closes. Without it that time was lost and nothing reported it. The table now
+  stops shrinking at about one row per session that ended without a stop.
+- **A rebuild no longer creates all-zero per-torrent rows** for activity that moved
+  nothing, which the aggregator never writes, so a rebuilt projection matches the one it
+  replaces.
+
+### Upgrading
+
+1. **Check your database version** against the minimums above.
+2. **If you have pruned on an earlier version, don't run `rebuild-totals` before
+   upgrading.** On the old version it would cut ratios.
+3. **Upgrade and migrate.** With `retention_days` set, a migration records your earlier
+   prunes' lost credit as carry and says how many members it covered. If you pruned in the
+   past but retention is now off, run `php artisan bloodhound:record-pruned-history` once.
+   It records only gaps pruning could have caused (per member and torrent, stored total
+   above the ledger, bytes only), so real drift stays reported.
+4. **Run `php artisan bloodhound:rebuild-totals` once.** Announces folded before this
+   version credited no time; the rebuild derives it from the announce log, as far back as
+   your retention has kept it. Until you do, `reconcile-ledger` reports every member's
+   seedtime as drift and says to run it.
+
 ## [7.0.0] — 2026-10-06
 
 > Downloads carry each member's own announce URL, and uploads must be private torrents by default.

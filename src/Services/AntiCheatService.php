@@ -6,33 +6,46 @@ namespace Marque\Bloodhound\Services;
 
 use Illuminate\Redis\Connections\Connection;
 use Illuminate\Support\Facades\Redis;
+use Marque\Bloodhound\Contracts\SeedboxRegistry;
 use Marque\Bloodhound\Events\CheatDetected;
+use Marque\Bloodhound\Support\Location;
 use Marque\Threepio\Services\PeerService;
+use Marque\Threepio\Support\PeerLookup;
 
 /**
  * Anti-cheat detection service for the tracker.
  *
- * Implements multiple detection strategies:
- * - Speed sanity checks (impossibly fast upload/download)
- * - Announce frequency limiting
- * - Connection limiting (per user, per IP)
- * - Swarm consistency checking (total uploaded vs downloaded)
- * - Port blacklisting
+ * Judges an announce against the same peer record the credit uses (one
+ * PeerLookup, read once), so nothing is checked against one baseline and
+ * credited against another. Refuses only what a legitimate client never does:
+ *
+ * - a blacklisted or invalid port;
+ * - a regular announce sooner than the minimum gap after the peer's last
+ *   accepted one (protocol events are never refused for timing);
+ * - a NEW location past the member's seeding or leeching limit on the
+ *   torrent, or a new client past the member's limit on it (a peer already
+ *   in the swarm is never refused by a count, and how many torrents a member
+ *   seeds is never limited).
+ *
+ * A claimed speed over the cap is not refused: those bytes are forfeited,
+ * the baseline moves on, and the rest of the announce is credited. Data and
+ * swarm anomalies are reported and never refused.
  */
 final class AntiCheatService
 {
-    private string $prefix;
-
     public function __construct(
         private readonly PeerService $peerService,
-    ) {
-        $this->prefix = config('threepio.redis.prefix', 'marque:');
-    }
+        private readonly SeedboxRegistry $seedboxes,
+    ) {}
 
     /**
      * Run all anti-cheat checks on an announce request.
      *
-     * @return array{passed: bool, reason: ?string}
+     * `forfeit_upload` / `forfeit_download` mark a direction whose bytes are
+     * not credited; `reason` says why, for the ledger row.
+     *
+     * @param  array<string, array<string, mixed>>  $livePeers  the torrent's live peers, as PeerService::livePeers() returns them
+     * @return array{passed: bool, reason: ?string, forfeit_upload: bool, forfeit_download: bool}
      */
     public function check(
         int $torrentId,
@@ -44,56 +57,52 @@ final class AntiCheatService
         int $downloaded,
         int $left,
         int $torrentSize,
+        ?string $event,
+        PeerLookup $lookup,
+        array $livePeers,
     ): array {
+        $pass = ['passed' => true, 'reason' => null, 'forfeit_upload' => false, 'forfeit_download' => false];
+
         if (! config('bloodhound.anti_cheat.enabled', true)) {
-            return ['passed' => true, 'reason' => null];
+            return $pass;
         }
 
-        // Check port blacklist
         $portCheck = $this->checkPort($port);
         if (! $portCheck['passed']) {
-            return $portCheck;
+            return $portCheck + $pass;
         }
 
-        // Check announce frequency
-        $frequencyCheck = $this->checkAnnounceFrequency($torrentId, $peerId);
-        if (! $frequencyCheck['passed']) {
-            return $frequencyCheck;
+        $gapCheck = $this->checkAnnounceGap($event, $ip, $lookup);
+        if (! $gapCheck['passed']) {
+            return $gapCheck + $pass;
         }
 
-        // Check connection limits
-        $connectionCheck = $this->checkConnectionLimits($torrentId, $userId, $ip);
-        if (! $connectionCheck['passed']) {
-            return $connectionCheck;
+        $limitCheck = $this->checkLocationLimits($userId, $peerId, $ip, $left, $event, $lookup, $livePeers);
+        if (! $limitCheck['passed']) {
+            return $limitCheck + $pass;
         }
 
-        // Check speed sanity
-        $speedCheck = $this->checkSpeedSanity($torrentId, $peerId, $uploaded, $downloaded);
-        if (! $speedCheck['passed']) {
-            $this->dispatchCheatEvent('speed_violation', $userId, $torrentId, $speedCheck['reason']);
-
-            return $speedCheck;
+        // More left than the torrent holds is impossible, but trove's size
+        // and a hybrid torrent's padding can disagree at the margin, and a
+        // false refusal locks a member out of the swarm. Reported, not refused.
+        if ($left > $torrentSize) {
+            $this->dispatchCheatEvent('data_anomaly', $userId, $torrentId, "Reported {$left} bytes left of a {$torrentSize}-byte torrent");
         }
 
-        // Check data sanity (can't download more than torrent size, etc.)
-        $dataCheck = $this->checkDataSanity($uploaded, $downloaded, $left, $torrentSize);
-        if (! $dataCheck['passed']) {
-            $this->dispatchCheatEvent('data_violation', $userId, $torrentId, $dataCheck['reason']);
-
-            return $dataCheck;
+        $speed = $this->checkSpeed($userId, $ip, $uploaded, $downloaded, $lookup);
+        if ($speed['reason'] !== null) {
+            $this->dispatchCheatEvent('speed_violation', $userId, $torrentId, $speed['reason']);
         }
 
-        // Check swarm consistency (run periodically, not on every announce)
-        // This is expensive so we sample
-        if (mt_rand(1, 100) <= 5) { // 5% of announces
+        // Swarm consistency is expensive, so it is sampled; never refused.
+        if (mt_rand(1, 100) <= 5) {
             $swarmCheck = $this->checkSwarmConsistency($torrentId, $torrentSize);
             if (! $swarmCheck['passed']) {
-                // Don't fail the announce, but log for investigation
                 $this->dispatchCheatEvent('swarm_anomaly', null, $torrentId, $swarmCheck['reason']);
             }
         }
 
-        return ['passed' => true, 'reason' => null];
+        return $speed + $pass;
     }
 
     /**
@@ -122,139 +131,202 @@ final class AntiCheatService
     }
 
     /**
-     * Check announce frequency (prevent hammering).
+     * Refuse a regular announce sooner than the minimum gap after the last
+     * accepted one (a hammer guard).
+     *
+     * Only a regular announce: started, completed and stopped are the
+     * client reporting something that happened, and refusing them loses a
+     * completion or leaves a ghost peer in the swarm (F7). Measured from the
+     * peer's record, so a refusal moves nothing: a client retrying every 30
+     * seconds is accepted every minute rather than locked out.
      */
-    public function checkAnnounceFrequency(int $torrentId, string $peerId): array
+    public function checkAnnounceGap(?string $event, string $ip, PeerLookup $lookup): array
     {
-        $redis = $this->redis();
-        $key = $this->prefix."announce_time:{$torrentId}:{$peerId}";
+        // From the same address only. A dual-stack client announces over IPv4
+        // and IPv6 seconds apart with one peer ID; the second is not
+        // hammering, and is credited only what is new since the first.
+        if ($event !== null || ! $lookup->isLive() || (string) ($lookup->baseline['ip'] ?? '') !== $ip) {
+            return ['passed' => true, 'reason' => null];
+        }
+
         $minGap = (int) config('bloodhound.anti_cheat.min_announce_gap', 60);
 
-        $lastAnnounce = $redis->get($key);
+        if ($lookup->readAt - (int) $lookup->baseline['last_action'] < $minGap) {
+            return [
+                'passed' => false,
+                'reason' => "Announcing too frequently (wait {$minGap}s between announces)",
+            ];
+        }
 
-        if ($lastAnnounce !== null) {
-            $elapsed = time() - (int) $lastAnnounce;
+        return ['passed' => true, 'reason' => null];
+    }
 
-            if ($elapsed < $minGap) {
+    /**
+     * Refuse a new location past the member's limit on this torrent, or a
+     * new client past their limit on it.
+     *
+     * A peer already in the swarm, announcing from where it was in the state
+     * it was in, is never refused by a count: the count used to include the
+     * announcing peer, so a member at the limit was refused on every announce
+     * from every client (F6). It is counted again, without itself, when it
+     * moves: to another location, or from seeding to leeching (starting as a
+     * seeder and then reporting bytes left was a way round the leeching
+     * limit). A location is an IP (an IPv6 /64), so a second client at a
+     * location the member already uses is not a new one. Seeding and
+     * leeching are limited separately: the leeching limit is what stops one
+     * account being shared to download.
+     *
+     * @param  array<string, array<string, mixed>>  $livePeers
+     */
+    public function checkLocationLimits(int $userId, string $peerId, string $ip, int $left, ?string $event, PeerLookup $lookup, array $livePeers): array
+    {
+        if ($event === 'stopped') {
+            return ['passed' => true, 'reason' => null];
+        }
+
+        $location = Location::of($ip);
+        $seeding = $left === 0;
+        $record = $lookup->isLive() ? $lookup->baseline : null;
+
+        $moved = $record !== null && Location::of((string) $record['ip']) !== $location;
+        $startedLeeching = $record !== null && (int) $record['left'] === 0 && ! $seeding;
+
+        if ($record !== null && ! $moved && ! $startedLeeching) {
+            return ['passed' => true, 'reason' => null];
+        }
+
+        $locations = [];
+
+        foreach ($livePeers as $otherPeerId => $peer) {
+            if ((string) $otherPeerId === $peerId || ($peer['user_id'] ?? null) !== $userId) {
+                continue;
+            }
+
+            if ((((int) $peer['left']) === 0) !== $seeding) {
+                continue;
+            }
+
+            $peerLocation = Location::of((string) $peer['ip']);
+
+            // Another client of the member, in the same state, already here.
+            if ($peerLocation === $location) {
+                $locations = null;
+
+                break;
+            }
+
+            $locations[$peerLocation] = true;
+        }
+
+        if ($locations !== null) {
+            $kind = $seeding ? 'seeding' : 'leeching';
+            $max = (int) config("bloodhound.anti_cheat.max_{$kind}_locations_per_torrent", $seeding ? 3 : 1);
+
+            if (count($locations) >= $max) {
                 return [
                     'passed' => false,
-                    'reason' => "Announcing too frequently (wait {$minGap}s between announces)",
+                    // A client restarted somewhere else under a new peer ID
+                    // is the usual way to arrive here, and the member can
+                    // clear the old session rather than wait for it to expire.
+                    'reason' => "Location limit reached ({$max} {$kind} locations per torrent); if a client restarted somewhere else, end the other session from your profile",
                 ];
             }
         }
 
-        // Update last announce time
-        $redis->setex($key, $minGap * 2, time());
+        // A new peer: at most max_clients_per_torrent of the member's live
+        // peer IDs on this torrent. Many peer IDs on one torrent pollute its
+        // swarm and inflate its seeder count; a member's number of torrents
+        // is never limited, because the members who seed thousands of them
+        // from one seedbox are the ones keeping the site alive.
+        if ($record === null) {
+            $max = (int) config('bloodhound.anti_cheat.max_clients_per_torrent', 5);
+            $clients = 0;
 
-        return ['passed' => true, 'reason' => null];
-    }
+            foreach ($livePeers as $otherPeerId => $peer) {
+                if ((string) $otherPeerId !== $peerId && ($peer['user_id'] ?? null) === $userId) {
+                    $clients++;
+                }
+            }
 
-    /**
-     * Check connection limits (per user per torrent, per IP).
-     */
-    public function checkConnectionLimits(int $torrentId, int $userId, string $ip): array
-    {
-        $maxPerTorrent = (int) config('bloodhound.anti_cheat.max_connections_per_torrent', 3);
-        $maxPerIp = (int) config('bloodhound.anti_cheat.max_connections_per_ip', 10);
-
-        // Check user connections on this torrent
-        $userPeerCount = $this->peerService->getUserPeerCountForTorrent($userId, $torrentId);
-        if ($userPeerCount >= $maxPerTorrent) {
-            return [
-                'passed' => false,
-                'reason' => "Connection limit exceeded ({$maxPerTorrent} per torrent)",
-            ];
-        }
-
-        // Check IP connections
-        $ipPeerCount = $this->peerService->getIpPeerCount($ip);
-        if ($ipPeerCount >= $maxPerIp) {
-            return [
-                'passed' => false,
-                'reason' => "Connection limit exceeded ({$maxPerIp} per IP)",
-            ];
-        }
-
-        return ['passed' => true, 'reason' => null];
-    }
-
-    /**
-     * Check for impossibly fast upload/download speeds.
-     */
-    public function checkSpeedSanity(int $torrentId, string $peerId, int $uploaded, int $downloaded): array
-    {
-        $maxUploadSpeed = (int) config('bloodhound.anti_cheat.max_upload_speed', 100 * 1024 * 1024);
-        $maxDownloadSpeed = (int) config('bloodhound.anti_cheat.max_download_speed', 100 * 1024 * 1024);
-
-        $existingPeer = $this->peerService->getPeer($torrentId, $peerId);
-
-        if ($existingPeer === null) {
-            return ['passed' => true, 'reason' => null];
-        }
-
-        $timeDelta = time() - $existingPeer['last_action'];
-
-        if ($timeDelta <= 0) {
-            return ['passed' => true, 'reason' => null];
-        }
-
-        // Calculate deltas
-        $uploadDelta = max(0, $uploaded - $existingPeer['uploaded']);
-        $downloadDelta = max(0, $downloaded - $existingPeer['downloaded']);
-
-        // Calculate speeds
-        $uploadSpeed = $uploadDelta / $timeDelta;
-        $downloadSpeed = $downloadDelta / $timeDelta;
-
-        if ($uploadSpeed > $maxUploadSpeed) {
-            $speedMbps = round($uploadSpeed / 1024 / 1024, 2);
-            $maxMbps = round($maxUploadSpeed / 1024 / 1024, 2);
-
-            return [
-                'passed' => false,
-                'reason' => "Impossible upload speed detected ({$speedMbps} MB/s, max: {$maxMbps} MB/s)",
-            ];
-        }
-
-        if ($downloadSpeed > $maxDownloadSpeed) {
-            $speedMbps = round($downloadSpeed / 1024 / 1024, 2);
-            $maxMbps = round($maxDownloadSpeed / 1024 / 1024, 2);
-
-            return [
-                'passed' => false,
-                'reason' => "Impossible download speed detected ({$speedMbps} MB/s, max: {$maxMbps} MB/s)",
-            ];
-        }
-
-        return ['passed' => true, 'reason' => null];
-    }
-
-    /**
-     * Check data sanity.
-     */
-    public function checkDataSanity(int $uploaded, int $downloaded, int $left, int $torrentSize): array
-    {
-        // Can't have downloaded more than the torrent size
-        if ($downloaded > $torrentSize * 1.1) { // 10% tolerance for protocol overhead
-            return [
-                'passed' => false,
-                'reason' => 'Downloaded more than torrent size',
-            ];
-        }
-
-        // Left + downloaded should roughly equal torrent size for leechers
-        if ($left > 0) {
-            $total = $left + $downloaded;
-            // Allow some variance for partial pieces, etc.
-            if ($total < $torrentSize * 0.9 || $total > $torrentSize * 1.1) {
+            if ($clients >= $max) {
                 return [
                     'passed' => false,
-                    'reason' => 'Data inconsistency (left + downloaded != torrent size)',
+                    'reason' => "Client limit reached ({$max} clients per torrent)",
                 ];
             }
         }
 
         return ['passed' => true, 'reason' => null];
+    }
+
+    /**
+     * Forfeit a direction whose claimed speed is over the cap.
+     *
+     * Measured over the real interval since the baseline the credit uses
+     * (live, retained or recovered: F14), against the seedbox cap when the
+     * announce comes from one of the member's approved seedboxes and the
+     * ordinary cap otherwise.
+     *
+     * Forfeited rather than refused. A refusal left the baseline where it
+     * was, so the next announce credited the same bytes over a longer window
+     * and the cap delayed nothing more than a minute (F9). Forfeiting
+     * advances the baseline: the claimed bytes never land, and the honest
+     * direction and the member's time are still credited.
+     *
+     * @return array{forfeit_upload: bool, forfeit_download: bool, reason: ?string}
+     */
+    public function checkSpeed(int $userId, string $ip, int $uploaded, int $downloaded, PeerLookup $lookup): array
+    {
+        $none = ['forfeit_upload' => false, 'forfeit_download' => false, 'reason' => null];
+        $credit = $lookup->credit($uploaded, $downloaded);
+
+        if ($credit['prior_at'] === null) {
+            return $none;
+        }
+
+        $elapsed = $credit['measured_at'] - $credit['prior_at'];
+
+        if ($elapsed <= 0) {
+            return $none;
+        }
+
+        $seedbox = $this->seedboxes->isSeedbox($userId, $ip);
+        $prefix = $seedbox ? 'bloodhound.anti_cheat.seedbox.' : 'bloodhound.anti_cheat.';
+        $default = $seedbox ? 1_250_000_000 : 100 * 1024 * 1024;
+
+        $result = $none;
+        $reasons = [];
+
+        foreach (['upload' => $credit['upload_delta'], 'download' => $credit['download_delta']] as $direction => $delta) {
+            $cap = (int) config("{$prefix}max_{$direction}_speed", $default);
+            $speed = $delta / $elapsed;
+
+            if ($speed > $cap) {
+                $result["forfeit_{$direction}"] = true;
+                $reasons[] = sprintf(
+                    '%s over the %scap (%s claimed, cap %s): %d bytes not credited',
+                    ucfirst($direction), $seedbox ? 'seedbox ' : '', self::rate($speed), self::rate($cap), $delta,
+                );
+            }
+        }
+
+        $result['reason'] = $reasons === [] ? null : implode('; ', $reasons);
+
+        return $result;
+    }
+
+    /**
+     * A transfer rate a person can read: B/s, KB/s, MB/s or GB/s.
+     */
+    private static function rate(float $bytesPerSecond): string
+    {
+        foreach (['GB' => 1024 ** 3, 'MB' => 1024 ** 2, 'KB' => 1024] as $unit => $size) {
+            if ($bytesPerSecond >= $size) {
+                return round($bytesPerSecond / $size, 2)." {$unit}/s";
+            }
+        }
+
+        return round($bytesPerSecond).' B/s';
     }
 
     /**
@@ -294,7 +366,7 @@ final class AntiCheatService
     public function flagSuspicious(int $userId, int $torrentId, string $reason): void
     {
         $redis = $this->redis();
-        $key = $this->prefix.'suspicious';
+        $key = $this->prefix().'suspicious';
 
         $data = json_encode([
             'user_id' => $userId,
@@ -315,7 +387,7 @@ final class AntiCheatService
     public function getSuspiciousActivity(int $limit = 100): array
     {
         $redis = $this->redis();
-        $entries = $redis->lrange($this->prefix.'suspicious', 0, $limit - 1);
+        $entries = $redis->lrange($this->prefix().'suspicious', 0, $limit - 1);
 
         return array_map(fn ($entry) => json_decode($entry, true), $entries);
     }
@@ -329,6 +401,11 @@ final class AntiCheatService
 
         // Dispatch event for listeners
         event(new CheatDetected($type, $userId, $torrentId, $reason));
+    }
+
+    private function prefix(): string
+    {
+        return config('threepio.redis.prefix', 'marque:');
     }
 
     private function redis(): Connection

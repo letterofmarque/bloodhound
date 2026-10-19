@@ -9,7 +9,7 @@ use Illuminate\Support\Facades\DB;
 use Marque\Bloodhound\Models\AnnounceLog;
 use Marque\Bloodhound\Models\LedgerCursor;
 use Marque\Bloodhound\Support\BatchIncrement;
-use Marque\Bloodhound\Support\SessionTime;
+use RuntimeException;
 
 /**
  * Folds ledger rows into the totals the site reads.
@@ -58,16 +58,56 @@ class LedgerAggregator
     /**
      * Fold everything the ledger has that this stream has not yet counted.
      *
-     * Loops until caught up rather than processing a single batch, so a
-     * backlog drains in one run instead of needing as many ticks as batches.
+     * To the head of the ledger: for the migrations that must leave totals
+     * folded before they finish, and for catching up by hand. The scheduler
+     * uses runScheduled(), which stops at the horizon.
      *
      * @return int rows folded
      */
     public function run(int $batchSize = 1000): int
     {
+        return $this->foldThrough(null, $batchSize);
+    }
+
+    /**
+     * The scheduled fold: only as far as the highest id the previous run saw.
+     *
+     * An id is handed out when an insert starts, not when it commits, so a
+     * row can become visible after a later id already has. Folding to the
+     * head could move the cursor past it, and it would never be counted
+     * (F12). Every row below the horizon has had a whole tick to commit. The
+     * cost is that totals trail the ledger by one to two runs, and a backlog
+     * drains in two.
+     *
+     * @return int rows folded
+     */
+    public function runScheduled(int $batchSize = 1000): int
+    {
+        $this->ensureCursor();
+
+        $horizon = (int) DB::table('ledger_cursors')->where('stream', self::STREAM)->value('horizon');
+        $folded = $this->foldThrough($horizon, $batchSize);
+
+        $head = (int) AnnounceLog::query()->max('id');
+
+        DB::table('ledger_cursors')
+            ->where('stream', self::STREAM)
+            ->where('horizon', '<', $head)
+            ->update(['horizon' => $head, 'updated_at' => now()]);
+
+        return $folded;
+    }
+
+    /**
+     * Fold batch after batch until caught up to $through (null: the head).
+     */
+    protected function foldThrough(?int $through, int $batchSize): int
+    {
+        $this->ensureCursor();
+
         $total = 0;
 
-        while (($folded = $this->foldNextBatch($batchSize)) > 0) {
+        while (($folded = $this->foldNextBatch($batchSize, $through)) > 0) {
             $total += $folded;
         }
 
@@ -77,85 +117,94 @@ class LedgerAggregator
     /**
      * Fold one batch, advancing the cursor in the same transaction.
      *
+     * The cursor row is locked first, and the position read under the lock,
+     * so a second fold (the scheduler and a manual run, two hosts without a
+     * shared cache lock, a migration) waits rather than folding the same
+     * rows. A no-op UPDATE rather than SELECT ... FOR UPDATE: it is the one
+     * spelling that takes a write lock on every engine, SQLite included,
+     * where it takes the database's.
+     *
+     * The advance is a compare-and-swap on the position just read. If
+     * anything moved the cursor in between, the batch rolls back and is
+     * redone from wherever it now is (F11).
+     *
      * @return int rows folded (0 means caught up)
      */
-    protected function foldNextBatch(int $batchSize): int
+    protected function foldNextBatch(int $batchSize, ?int $through = null): int
     {
-        $position = LedgerCursor::positionFor(self::STREAM);
+        return DB::transaction(function () use ($batchSize, $through) {
+            $this->lockCursor();
 
-        $rows = AnnounceLog::query()
-            ->where('id', '>', $position)
-            ->orderBy('id')
-            ->limit($batchSize)
-            ->get(['id', 'user_id', 'torrent_id', 'upload_delta', 'download_delta']);
+            $position = LedgerCursor::positionFor(self::STREAM);
 
-        if ($rows->isEmpty()) {
-            return 0;
-        }
+            $rows = AnnounceLog::query()
+                ->where('id', '>', $position)
+                ->when($through !== null, fn ($query) => $query->where('id', '<=', $through))
+                ->orderBy('id')
+                ->limit($batchSize)
+                ->get(['id', 'user_id', 'torrent_id', 'upload_delta', 'download_delta', 'seed_seconds', 'leech_seconds']);
 
-        DB::transaction(function () use ($rows, $position) {
-            $this->applyDeltas($rows, $this->sessionTimes($position, $rows->last()->id));
+            if ($rows->isEmpty()) {
+                return 0;
+            }
+
+            $this->applyDeltas($rows);
 
             // Inside the transaction, deliberately. If this fails, the writes
             // above roll back with it and the batch is simply redone.
-            $this->advanceCursor($rows->last()->id);
+            $this->advanceCursor($position, $rows->last()->id);
+
+            return $rows->count();
         });
-
-        return $rows->count();
     }
 
     /**
-     * Seconds seeded and leeched per (user, torrent), for the intervals the
-     * rows in ($after, $through] close (Spec #121).
+     * Take the cursor row's lock for the rest of the transaction.
      *
-     * Summed in the database. An interval whose opening row was folded by an
-     * earlier batch or run is reached back for there, and credited here once,
-     * by the row that closes it.
-     *
-     * @return array<string, array{user_id: int, torrent_id: int, seedtime: int, leechtime: int}>
+     * Also what a rebuild takes, so the two never interleave.
      */
-    protected function sessionTimes(int $after, int $through): array
+    public function lockCursor(): void
     {
-        $sums = SessionTime::forLedger()->intervals($after, $through)
-            ->groupBy('user_id', 'torrent_id')
-            ->selectRaw('user_id, torrent_id, SUM(seed_seconds) as seed, SUM(leech_seconds) as leech')
-            ->get();
-
-        $times = [];
-
-        foreach ($sums as $sum) {
-            $times[$sum->user_id.':'.$sum->torrent_id] = [
-                'user_id' => (int) $sum->user_id,
-                'torrent_id' => (int) $sum->torrent_id,
-                'seedtime' => (int) $sum->seed,
-                'leechtime' => (int) $sum->leech,
-            ];
-        }
-
-        return $times;
+        DB::table('ledger_cursors')
+            ->where('stream', self::STREAM)
+            ->update(['position' => DB::raw(DB::getQueryGrammar()->wrap('position'))]);
     }
 
     /**
-     * Add each row's deltas, and the batch's session times, to the totals
-     * they belong to.
+     * The cursor row exists before anything locks it: a lock on no row
+     * protects nothing.
+     */
+    public function ensureCursor(): void
+    {
+        DB::table('ledger_cursors')->insertOrIgnore([
+            'stream' => self::STREAM,
+            'position' => 0,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+    }
+
+    /**
+     * Add each row's credit (bytes and seconds) to the totals it belongs to.
+     *
+     * Every row carries its own credit, written at announce time, so a fold
+     * is a sum: nothing pairs one row with another, and a batch boundary
+     * splits nothing.
      *
      * Grouped per (user, torrent) so a batch of many announces from one peer
      * is a single write rather than one per row.
      *
      * @param  Collection<int, AnnounceLog>  $rows
-     * @param  array<string, array{user_id: int, torrent_id: int, seedtime: int, leechtime: int}>  $times
      */
-    protected function applyDeltas($rows, array $times): void
+    protected function applyDeltas($rows): void
     {
         $perTorrent = [];
 
         foreach ($rows as $row) {
-            // Skipped for BYTES only. An idle seeder's announce and every
-            // `stopped` move no bytes, and are exactly what seedtime is made
-            // of, so they reach the time sums above; here they must still
-            // contribute nothing, or every announce that moved nothing would
-            // write a torrent_user row.
-            if ($row->upload_delta === 0 && $row->download_delta === 0) {
+            // A row that credits nothing (a refusal, a first announce) is not
+            // activity, and writes no torrent_user row.
+            if ($row->upload_delta === 0 && $row->download_delta === 0
+                && $row->seed_seconds === 0 && $row->leech_seconds === 0) {
                 continue;
             }
 
@@ -164,20 +213,33 @@ class LedgerAggregator
             $perTorrent[$key] ??= $this->emptyEntry($row->user_id, $row->torrent_id);
             $perTorrent[$key]['uploaded'] += $row->upload_delta;
             $perTorrent[$key]['downloaded'] += $row->download_delta;
+            $perTorrent[$key]['seedtime'] += $row->seed_seconds;
+            $perTorrent[$key]['leechtime'] += $row->leech_seconds;
         }
 
-        foreach ($times as $key => $time) {
-            // A pair that closed with nothing to credit (a stopped row's
-            // successor, a first announce) is not activity either.
-            if ($time['seedtime'] === 0 && $time['leechtime'] === 0) {
-                continue;
+        $perUser = [];
+
+        foreach ($perTorrent as $entry) {
+            $perUser[$entry['user_id']] ??= ['uploaded' => 0, 'downloaded' => 0, 'seedtime' => 0, 'leechtime' => 0];
+
+            foreach (self::TOTALS as $column) {
+                $perUser[$entry['user_id']][$column] += $entry[$column];
             }
-
-            $perTorrent[$key] ??= $this->emptyEntry($time['user_id'], $time['torrent_id']);
-            $perTorrent[$key]['seedtime'] += $time['seedtime'];
-            $perTorrent[$key]['leechtime'] += $time['leechtime'];
         }
 
+        $this->addToTorrentUsers($perTorrent);
+        $this->addToUsers($perUser);
+    }
+
+    /**
+     * Add amounts to the totals directly: credit that is not a ledger row's
+     * (carry recorded by an upgrade step), written the way a fold writes.
+     * The caller holds the cursor lock.
+     *
+     * @param  array<string, array{user_id: int, torrent_id: int, uploaded: int, downloaded: int, seedtime: int, leechtime: int}>  $perTorrent
+     */
+    public function addToTotals(array $perTorrent): void
+    {
         $perUser = [];
 
         foreach ($perTorrent as $entry) {
@@ -307,17 +369,17 @@ class LedgerAggregator
         }
     }
 
-    protected function advanceCursor(int $position): void
+    protected function advanceCursor(int $from, int $to): void
     {
-        $cursor = LedgerCursor::query()->where('stream', self::STREAM)->first();
+        $moved = DB::table('ledger_cursors')
+            ->where('stream', self::STREAM)
+            ->where('position', $from)
+            ->update(['position' => $to, 'updated_at' => now()]);
 
-        if ($cursor === null) {
-            LedgerCursor::create(['stream' => self::STREAM, 'position' => $position]);
-
-            return;
+        if ($moved !== 1) {
+            throw new RuntimeException(
+                "The ledger cursor moved from {$from} while this batch was being folded; the batch was rolled back and will be redone."
+            );
         }
-
-        $cursor->position = $position;
-        $cursor->save();
     }
 }

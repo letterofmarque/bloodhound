@@ -11,15 +11,16 @@ return [
     | Settings specific to the private tracker. Shared protocol settings
     | (announce intervals, peer storage, ports) live in threepio config.
     |
-    | REQUIRES REDIS. Peer storage is a real Redis server, not Laravel's cache
-    | pointed at one — PeerService uses sets, hashes and atomic counters, none
-    | of which the cache abstraction offers. Without a working connection the
-    | announce path fatals on the first request. You need ext-redis or
-    | predis/predis installed; see packages/threepio/README.md.
+    | REQUIRES REDIS, AND A REDIS THAT KEEPS WHAT IT HOLDS. Peer storage is a
+    | real Redis server, not Laravel's cache pointed at one — PeerService uses
+    | sets, hashes and atomic counters, none of which the cache abstraction
+    | offers. You need ext-redis or predis/predis installed; see
+    | packages/threepio/README.md.
     |
-    | Note the failure mode if Redis restarts empty: it holds the baseline
-    | announce deltas are diffed against, so the next announce credits zero
-    | silently. The announce ledger below is what recovers from that.
+    | Every announce is credited against the peer's last counters, held in
+    | Redis, so Redis is a store here, not a cache: run it with appendonly yes
+    | and maxmemory-policy noeviction, on a database of its own. See 'redis'
+    | below for what happens when it isn't.
     |
     */
 
@@ -96,22 +97,21 @@ return [
     | Ratio Tracking
     |--------------------------------------------------------------------------
     |
-    | Controls how user ratios are tracked.
-    |
-    | 'full' - Track upload/download bytes, enforce ratio requirements
-    | 'off' - No tracking at all
-    | 'seedtime' - Track seeding time instead (ratioless)
+    | Not yet read by anything: bytes, seedtime and leechtime are recorded the
+    | same way in every mode, and no minimum is enforced. These keys reserve
+    | the settings enforcement will read: 'full' (a minimum ratio), 'seedtime'
+    | (a minimum seedtime instead) and 'off' (no minimum). See #10732.
     |
     */
 
     // check-docs: ignore — documented but not yet enforced, read by nothing until #10732
     'ratio_mode' => env('BLOODHOUND_RATIO_MODE', 'full'),
 
-    // Minimum ratio required (only applies when ratio_mode = 'full')
+    // The minimum ratio 'full' will enforce
     // check-docs: ignore — not yet enforced, read by nothing until #10732
     'min_ratio' => env('BLOODHOUND_MIN_RATIO', 0.5),
 
-    // Minimum seed time in seconds (only applies when ratio_mode = 'seedtime')
+    // The minimum seedtime, in seconds, 'seedtime' will enforce
     // check-docs: ignore — not yet enforced, read by nothing until #10732
     'min_seedtime' => env('BLOODHOUND_MIN_SEEDTIME', 86400), // 24 hours
 
@@ -130,8 +130,9 @@ return [
         'mode' => env('BLOODHOUND_CLIENT_MODE', 'whitelist'), // 'whitelist' or 'blacklist'
     ],
 
-    // Whitelisted clients (used when mode = 'whitelist')
-    // Format: peer_id_prefix => [min_version, max_version, blocked_versions]
+    // Clients allowed when mode = 'whitelist'. Each entry: a peer_id_pattern
+    // whose captures are the version digits, the version_format they make,
+    // and min_version, max_version (null for none) and blocked_versions.
     'whitelist' => [
         // qBittorrent: -qB4210- = version 4.2.1.0
         'qBittorrent' => [
@@ -220,55 +221,113 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Anti-Cheat Configuration
+    | Redis
     |--------------------------------------------------------------------------
+    |
+    | Every announce is credited against the peer's last counters, kept in
+    | Redis, so Redis must keep what it holds: appendonly yes (appendfsync
+    | everysec) and maxmemory-policy noeviction, on a database of its own
+    | (THREEPIO_REDIS_CONNECTION). In production, announces are refused
+    | until it does; elsewhere a warning is logged. A passing check is cached
+    | for five minutes and a failing one for 15 seconds, and
+    | `php artisan bloodhound:check-redis` says what to change. If your provider makes the data durable another way
+    | (replication, snapshots) and offers no AOF, set durability to
+    | 'attested': that covers persistence, and the eviction policy is still
+    | checked whenever Redis answers INFO.
+    |
+    | If Redis loses its data anyway, bloodhound notices and, for twice
+    | threepio.peer_expiry, reads a missing peer's baseline from the ledger
+    | (recovery mode; `bloodhound:check-redis --recover` opens it by hand).
+    |
+    */
+
+    'redis' => [
+        'durability' => env('BLOODHOUND_REDIS_DURABILITY', 'required'),
+    ],
+
+    // Seconds an expired peer's record is kept as its baseline after its last
+    // announce (7 days), so a member whose client comes back under the same
+    // peer ID without having sent `stopped` is credited what it moved in
+    // between. The hourly sweep moves expired records aside; a stopped peer
+    // is never kept.
+    'baseline_retention' => env('BLOODHOUND_BASELINE_RETENTION', 7 * 86_400),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Anti-Cheat
+    |--------------------------------------------------------------------------
+    |
+    | Refuses only what a legitimate client never does, and never refuses a
+    | peer already in the swarm on a count: a bad port, a regular announce
+    | inside the minimum gap, a new location past the member's limit, a new
+    | client past the member's clients on the torrent. A refusal is a flagged ledger row that credits
+    | nothing and changes nothing in Redis; it fires no event. A speed over
+    | the cap is forfeited, not refused; it, a data anomaly and a sampled
+    | swarm anomaly fire CheatDetected.
+    |
+    | Removed in 8.0.0: max_connections_per_torrent, replaced by the two
+    | location limits below. If it is still set it is ignored, and a warning
+    | is logged once a day.
+    |
     */
 
     'anti_cheat' => [
         'enabled' => env('BLOODHOUND_ANTICHEAT', true),
 
-        // Maximum upload speed in bytes/second (default 100 MB/s - generous for seedboxes)
+        // The speed cap for ordinary peers, in bytes/second, per direction.
+        // Bytes claimed over it in one interval are forfeited: not credited,
+        // and the baseline moves on so they never land later. The other
+        // direction and the time are still credited. Lower it to what your
+        // members' connections actually do; seedboxes have their own cap
+        // below. (100 MiB/s is about 840 Mbit/s.)
         'max_upload_speed' => env('BLOODHOUND_MAX_UPLOAD_SPEED', 100 * 1024 * 1024),
-
-        // Maximum download speed in bytes/second (default 100 MB/s)
         'max_download_speed' => env('BLOODHOUND_MAX_DOWNLOAD_SPEED', 100 * 1024 * 1024),
 
-        // Minimum time between announces in seconds (prevent hammering)
+        // The cap for announces from inside one of the member's approved
+        // seedboxes. 1,250,000,000 bytes/second is 10 Gbit/s.
+        // Members register seedboxes (an address, or a provider's range);
+        // with require_approval an admin approves each one before its cap
+        // applies, and without it registering approves it. min_prefix_v4/v6
+        // are the widest range allowed: a /24 (IPv4) or a /48 (IPv6), so a
+        // range cannot take in other customers of the same provider. Only
+        // the speed cap changes for a seedbox; the location limits and the
+        // client cap still apply.
+        'seedbox' => [
+            'max_upload_speed' => env('BLOODHOUND_SEEDBOX_MAX_UPLOAD_SPEED', 1_250_000_000),
+            'max_download_speed' => env('BLOODHOUND_SEEDBOX_MAX_DOWNLOAD_SPEED', 1_250_000_000),
+            'require_approval' => env('BLOODHOUND_SEEDBOX_REQUIRE_APPROVAL', true),
+            'min_prefix_v4' => 24,
+            'min_prefix_v6' => 48,
+        ],
+
+        // Minimum seconds between two regular announces from one peer at one
+        // address (a hammer guard), measured from its last accepted announce;
+        // a dual-stack client's announce from its other address is not
+        // hammering. started,
+        // completed and stopped are never refused for timing, and a refusal
+        // moves nothing, so a client retrying early is accepted once the gap
+        // has passed.
         'min_announce_gap' => env('BLOODHOUND_MIN_ANNOUNCE_GAP', 60),
 
-        // Maximum simultaneous connections per user per torrent
-        'max_connections_per_torrent' => env('BLOODHOUND_MAX_CONN_TORRENT', 3),
+        // Locations a member may seed and leech one torrent from at once. A
+        // location is an IP address (an IPv6 /64). Only a NEW location is
+        // refused: a client already in the swarm is never cut off by a count,
+        // so a leecher that finishes becomes a seeder without being refused,
+        // and a second client at a location already in use is not new.
+        // Leeching from more than one place is how one account is shared.
+        // These replace max_connections_per_torrent.
+        'max_seeding_locations_per_torrent' => env('BLOODHOUND_MAX_SEEDING_LOCATIONS', 3),
+        'max_leeching_locations_per_torrent' => env('BLOODHOUND_MAX_LEECHING_LOCATIONS', 1),
 
-        // Maximum simultaneous connections per IP
-        'max_connections_per_ip' => env('BLOODHOUND_MAX_CONN_IP', 10),
+        // A member's live clients (peer IDs) on one torrent, counted only for
+        // a new one. Many peer IDs on one torrent pollute its swarm; one
+        // client per torrent across thousands of torrents is a seedbox doing
+        // its job, and how many torrents a member seeds is never limited.
+        'max_clients_per_torrent' => env('BLOODHOUND_MAX_CLIENTS_PER_TORRENT', 5),
 
         // Block announces from known datacenter/proxy IPs (requires external list)
         // check-docs: ignore — never built, needs a design decision first (#10813)
         'block_datacenter_ips' => env('BLOODHOUND_BLOCK_DC_IPS', false),
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Stats Queue — DEPRECATED, no longer read
-    |--------------------------------------------------------------------------
-    |
-    | Stats no longer travel through a queue. Byte counts are written to the
-    | ledger on the announce path and folded into totals by
-    | bloodhound:aggregate-ledger, so nothing in this package reads these keys
-    | any more (Spec #99).
-    |
-    | Kept for one release so an existing published config does not break, and
-    | removed in the next major.
-    |
-    */
-
-    'queue' => [
-        // check-docs: ignore — retired by the ledger, removed at the next major (#10816)
-        'enabled' => env('BLOODHOUND_QUEUE_STATS', true),
-        // check-docs: ignore — retired by the ledger, removed at the next major (#10816)
-        'connection' => env('BLOODHOUND_QUEUE_CONNECTION', null), // null = default
-        // check-docs: ignore — retired by the ledger, removed at the next major (#10816)
-        'queue' => env('BLOODHOUND_QUEUE_NAME', 'tracker'),
     ],
 
     /*
@@ -299,20 +358,20 @@ return [
     |--------------------------------------------------------------------------
     |
     | The ledger. Full-detail history of every announce — every started,
-    | regular-interval, completed, and stopped request, with the cumulative
-    | totals the client reported, the delta we credited, and the baseline that
-    | delta was computed against.
+    | regular-interval, completed, and stopped request, accepted or refused,
+    | with the cumulative totals the client reported, the bytes and seconds
+    | credited, and the baseline they were measured against. Each row carries
+    | its own credit, and every total is a sum of rows plus ledger_carry.
     |
-    | ON by default, and this is deliberate (Spec #99, inverting Spec #98).
-    | This table is the source of truth for ratio. User and per-torrent totals
-    | are projections rebuilt from it, and a wrong number can only be detected
-    | — let alone corrected — by comparing it against this. A source of truth
-    | cannot be opt-in: an install running without it has no way to know its
-    | ratios are wrong, and ratio is what gets people banned.
+    | This table is the source of truth for ratio and seedtime. User and
+    | per-torrent totals are projections summed from it, and a wrong number
+    | can only be detected — let alone corrected — by comparing it against
+    | this. Ratio is what gets people banned.
     |
-    | Turning it off is supported, but it disables reconciliation, the rebuild
-    | command, and the arithmetic audit along with it. You are choosing to
-    | accumulate numbers nothing can verify.
+    | It cannot be turned off. Every credit is written here and nowhere else,
+    | so a tracker without it would credit nobody anything. (The `enabled` key
+    | was removed in 8.0.0; a config still setting it false is refused at
+    | boot. The `queue` keys were removed too; nothing read them.)
     |
     | 'connection' lets you write this table to a SEPARATE database from the
     | rest of the app — set it to any connection name defined in
@@ -327,18 +386,16 @@ return [
     | everything stays the default because retention is an operator judgement
     | about storage, not something to guess on their behalf.
     |
-    | Pruning carries forward what it deletes: the credit the pruned rows
-    | produced moves into ledger_carry in the same transaction, so reconcile
-    | and rebuild-totals stay exact after a prune. Rows the aggregator has not
-    | consumed yet are never pruned, whatever their age, and neither is each
-    | peer's latest aggregated announce unless it was a stop: a later announce
-    | is measured from it. So the table stops at your retention window plus
-    | about one row per session that ended without a stop.
+    | Pruning carries forward what it deletes: each row carries its own credit
+    | (bytes and seconds), and what the pruned rows credited moves into
+    | ledger_carry in the same transaction, so reconcile and rebuild-totals
+    | stay exact after a prune. Rows the aggregator has not consumed yet are
+    | never pruned, whatever their age. So the table stops at your retention
+    | window.
     |
     */
 
     'announce_log' => [
-        'enabled' => env('BLOODHOUND_ANNOUNCE_LOG', true),
         'connection' => env('BLOODHOUND_ANNOUNCE_LOG_CONNECTION'),
         'retention_days' => env('BLOODHOUND_ANNOUNCE_LOG_RETENTION_DAYS'),
     ],

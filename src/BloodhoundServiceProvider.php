@@ -5,18 +5,25 @@ declare(strict_types=1);
 namespace Marque\Bloodhound;
 
 use Illuminate\Auth\Events\Verified;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schedule;
 use Illuminate\Support\ServiceProvider;
 use Marque\Bloodhound\Console\Commands\AggregateLedger;
 use Marque\Bloodhound\Console\Commands\AuditLedger;
+use Marque\Bloodhound\Console\Commands\BackfillLedger;
+use Marque\Bloodhound\Console\Commands\CheckRedis;
+use Marque\Bloodhound\Console\Commands\ManageSeedboxes;
 use Marque\Bloodhound\Console\Commands\PruneAnnounceLog;
 use Marque\Bloodhound\Console\Commands\RebuildTotals;
 use Marque\Bloodhound\Console\Commands\ReconcileLedger;
 use Marque\Bloodhound\Console\Commands\RecordPrunedHistory;
 use Marque\Bloodhound\Console\Commands\SyncSwarmCounts;
 use Marque\Bloodhound\Contracts\AnnounceLogServiceInterface;
+use Marque\Bloodhound\Contracts\SeedboxRegistry;
 use Marque\Bloodhound\Events\TorrentCompleted;
+use Marque\Bloodhound\Exceptions\RemovedConfiguration;
 use Marque\Bloodhound\Listeners\IssueAnnounceKeyOnVerification;
 use Marque\Bloodhound\Listeners\RecordCompletion;
 use Marque\Bloodhound\Models\AnnounceLog;
@@ -24,11 +31,18 @@ use Marque\Bloodhound\Services\AnnounceLogService;
 use Marque\Bloodhound\Services\AnnounceService;
 use Marque\Bloodhound\Services\AntiCheatService;
 use Marque\Bloodhound\Services\ClientValidationService;
+use Marque\Bloodhound\Services\RedisDurability;
+use Marque\Bloodhound\Services\Seedboxes;
 use Marque\Bloodhound\Services\TorrentFilePolicy;
+use Marque\Bloodhound\Services\TrackerSessions;
 use Marque\Bloodhound\Services\TrackerStatsService;
+use Marque\Bloodhound\Support\PeerIdColumn;
 use Marque\Threepio\Services\PeerService;
+use Marque\Trove\Contracts\SeedboxesInterface;
 use Marque\Trove\Contracts\TorrentFilePolicyInterface;
+use Marque\Trove\Contracts\TrackerSessionsInterface;
 use Marque\Trove\Contracts\TrackerStatsInterface;
+use Throwable;
 
 class BloodhoundServiceProvider extends ServiceProvider
 {
@@ -56,6 +70,17 @@ class BloodhoundServiceProvider extends ServiceProvider
         // member's keyed announce URL, and private torrents by default.
         $this->app->singleton(TorrentFilePolicyInterface::class, TorrentFilePolicy::class);
 
+        // Members' seedboxes (Job #193): one store, two faces. trove's
+        // SeedboxesInterface is what a frontend manages them through;
+        // SeedboxRegistry is the question the announce path asks.
+        $this->app->singleton(Seedboxes::class);
+        $this->app->singleton(SeedboxesInterface::class, fn ($app) => $app->make(Seedboxes::class));
+        $this->app->singleton(SeedboxRegistry::class, fn ($app) => $app->make(Seedboxes::class));
+
+        // A member's live sessions, and ending one (Job #193, D8), for a
+        // frontend to show: the leeching limit is only fair with it.
+        $this->app->singleton(TrackerSessionsInterface::class, TrackerSessions::class);
+
         // Teach threepio's peer store to recover a lost baseline from the
         // ledger (Spec #99 CP3).
         //
@@ -64,8 +89,20 @@ class BloodhoundServiceProvider extends ServiceProvider
         // record. It exposes the seam; the private tracker fills it. hound
         // leaves it unfilled and keeps the old behaviour, which is right —
         // a public tracker has no ledger and nothing to recover from.
+        //
+        // Since Job #193 Redis is a required, durable store, so the ledger is
+        // read for a baseline only in a recovery window, opened when Redis has
+        // actually been lost (RedisDurability::recovering()). And an expired
+        // peer's record is kept as its baseline for baseline_retention, so a
+        // member back from a crash without having sent `stopped` is credited
+        // what they moved in between.
+        $this->app->singleton(RedisDurability::class);
+
         $this->app->extend(PeerService::class, function (PeerService $peers) {
-            $peers->resolveBaselineUsing($this->recoverBaselineFromLedger(...));
+            $peers->retainBaselinesFor((int) config('bloodhound.baseline_retention', 7 * 86_400));
+            $peers->resolveBaselineUsing(fn (int $torrentId, string $peerId, ?int $userId = null) => $this->app->make(RedisDurability::class)->recovering()
+                ? $this->recoverBaselineFromLedger($torrentId, $peerId, $userId)
+                : null);
 
             return $peers;
         });
@@ -76,37 +113,49 @@ class BloodhoundServiceProvider extends ServiceProvider
      *
      * Called only when Redis has no record of the peer, so this is the outage
      * path, not the hot path — a warm session never reaches it. Scoped to the
-     * exact (torrent, peer) pair: a different peer_id is a different client
-     * session with its own counters starting from zero, and a different
-     * torrent is unrelated entirely. Inheriting either one's baseline would be
-     * worse than having none.
+     * exact (user, torrent, peer): a different peer_id is a different client
+     * session, a different torrent is unrelated, and another member's
+     * counters are never this member's baseline (F15).
      *
-     * @return array{uploaded: int, downloaded: int}|null
+     * The baseline is the last row that took part in the session: a refusal
+     * credited nothing and diffed against nothing, so it is skipped (F5: its
+     * counters were never accepted), and an opening balance is not an
+     * announce. If that row is a stop, or a session the member ended, the
+     * session is over and there is no baseline: the next announce starts a
+     * new one.
+     *
+     * @return array{uploaded: int, downloaded: int, left: int, last_action: int}|null
      */
-    protected function recoverBaselineFromLedger(int $torrentId, string $peerId): ?array
+    protected function recoverBaselineFromLedger(int $torrentId, string $peerId, ?int $userId = null): ?array
     {
-        if (! config('bloodhound.announce_log.enabled', true)) {
-            return null;
-        }
-
         $last = AnnounceLog::query()
             ->where('torrent_id', $torrentId)
-            ->where('peer_id', $peerId)
+            ->where('peer_id', PeerIdColumn::encode($peerId))
+            ->where('user_id', $userId)
+            ->where('event', '!=', AnnounceLog::EVENT_OPENING_BALANCE)
+            ->where(fn ($query) => $query->where('anti_cheat_flagged', false)->orWhereNotNull('prior_up'))
+            // No further back than a retained baseline lasts: a peer away
+            // longer than that starts a new session, recovery or not.
+            ->where('created_at', '>=', now()->subSeconds((int) config('bloodhound.baseline_retention', 7 * 86_400)))
             ->orderByDesc('id')
             ->first();
 
-        if ($last === null) {
+        if ($last === null || in_array($last->event, AnnounceLog::SESSION_ENDS, true)) {
             return null;
         }
 
         return [
             'uploaded' => $last->uploaded,
             'downloaded' => $last->downloaded,
+            'left' => $last->left,
+            'last_action' => $last->created_at->getTimestamp(),
         ];
     }
 
     public function boot(): void
     {
+        $this->refuseRemovedConfiguration();
+
         $this->loadRoutesFrom(__DIR__.'/../routes/tracker.php');
         $this->loadMigrationsFrom(__DIR__.'/../database/migrations');
 
@@ -134,6 +183,55 @@ class BloodhoundServiceProvider extends ServiceProvider
     }
 
     /**
+     * Stop a stale published config from silently changing what the tracker does.
+     *
+     * announce_log.enabled was removed in 8.0.0: credit is written only to
+     * the ledger, so a tracker without it credits nobody anything (F4). A
+     * config that still turns it off is refused outright. One that says true
+     * is the old default and harmless.
+     *
+     * max_connections_per_torrent and max_connections_per_ip were replaced
+     * (by location limits, and by a per-member client cap on each torrent).
+     * Ignoring them changes nothing dangerous, so they are reported once a
+     * day, not refused.
+     * The retired queue keys are ignored: nothing ever read them in 7.x either.
+     */
+    public function refuseRemovedConfiguration(): void
+    {
+        if (config('bloodhound.announce_log.enabled') === false) {
+            throw new RemovedConfiguration(
+                'bloodhound.announce_log.enabled was removed in 8.0.0: the ledger is always on, because every credit '
+                .'is written to it and nowhere else. Delete the key (or BLOODHOUND_ANNOUNCE_LOG) from your config.'
+            );
+        }
+
+        $replaced = [
+            'max_connections_per_torrent' => 'max_seeding_locations_per_torrent and max_leeching_locations_per_torrent',
+            'max_connections_per_ip' => 'max_clients_per_torrent (a member\'s clients on one torrent; how many torrents one address seeds is no longer limited)',
+        ];
+        $stale = array_intersect_key($replaced, (array) config('bloodhound.anti_cheat'));
+
+        if ($stale !== [] && $this->firstToday('bloodhound:removed-config-reported')) {
+            foreach ($stale as $key => $instead) {
+                Log::warning("bloodhound.anti_cheat.{$key} was removed in 8.0.0 and is ignored. Use {$instead}.");
+            }
+        }
+    }
+
+    /**
+     * Whether this is the first time today, by the cache. With the cache down,
+     * yes: an extra log line beats a boot that fails on a cache outage.
+     */
+    private function firstToday(string $key): bool
+    {
+        try {
+            return Cache::add($key, true, 86_400);
+        } catch (Throwable) {
+            return true;
+        }
+    }
+
+    /**
      * Register Artisan commands and their schedules.
      *
      * The prune schedule is registered unconditionally rather than gated on
@@ -152,6 +250,9 @@ class BloodhoundServiceProvider extends ServiceProvider
         $this->commands([
             AggregateLedger::class,
             AuditLedger::class,
+            BackfillLedger::class,
+            CheckRedis::class,
+            ManageSeedboxes::class,
             PruneAnnounceLog::class,
             RebuildTotals::class,
             RecordPrunedHistory::class,

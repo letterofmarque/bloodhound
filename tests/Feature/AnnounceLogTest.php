@@ -7,7 +7,6 @@ declare(strict_types=1);
 // than calling AnnounceService directly, since the thing under test is the
 // actual wiring from a real request through to a logged row.
 
-use Illuminate\Support\Facades\Queue;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Testing\TestResponse;
 use Marque\Bloodhound\Models\AnnounceLog;
@@ -64,37 +63,7 @@ function announceUrl(TestUser $user, Torrent $torrent, array $params = []): stri
     return '/announce/'.keyOf($user)."?{$query}";
 }
 
-// Spec #99 (CP1) inverted the default to enabled — the ledger is the source of
-// truth for ratio and cannot be opt-in. Turning it off is still supported, and
-// still has to actually turn it off, so these set the config explicitly rather
-// than leaning on whatever the default happens to be.
-describe('announce log explicitly disabled', function () {
-    beforeEach(function () {
-        config(['bloodhound.announce_log.enabled' => false]);
-    });
-
-    it('dispatches no LogAnnounce job at all', function () {
-        Queue::fake();
-
-        announceGet($this, announceUrl($this->user, $this->torrent, ['event' => 'started']));
-
-        Queue::assertNothingPushed();
-    });
-
-    it('writes no rows', function () {
-        config(['bloodhound.queue.enabled' => false]);
-
-        announceGet($this, announceUrl($this->user, $this->torrent, ['event' => 'started']));
-
-        expect(AnnounceLog::count())->toBe(0);
-    });
-});
-
-describe('announce log enabled (the default)', function () {
-    beforeEach(function () {
-        config(['bloodhound.announce_log.enabled' => true]);
-        config(['bloodhound.queue.enabled' => false]); // dispatchSync-equivalent for the test
-    });
+describe('the announce log', function () {
 
     it('logs a full announce lifecycle: started, regular, completed, stopped', function () {
         // This test fires 4 announces back-to-back, synthetically — a real
@@ -182,21 +151,19 @@ describe('announce log enabled (the default)', function () {
 });
 
 describe('the existing Redis suspicious list', function () {
-    it('still fires unconditionally, regardless of announce_log.enabled', function () {
+    it('still fires', function () {
         // Spec #98 Decision: AntiCheatService::flagSuspicious() is NOT gated
         // by the new feature — it must keep working for an operator who
         // hasn't opted into announce_log at all. checkPort() rejects before
         // ever calling dispatchCheatEvent()/flagSuspicious() (confirmed by
         // reading AntiCheatService::check()), so this needs a violation that
-        // actually reaches that call — data sanity (downloaded > torrent
-        // size) does.
-        config(['bloodhound.announce_log.enabled' => false]);
+        // actually reaches that call: more left than the torrent holds, which
+        // is reported (and, since Job #193, not refused).
         config(['bloodhound.anti_cheat.enabled' => true]);
 
         announceGet($this, announceUrl($this->user, $this->torrent, [
             'event' => 'started',
-            'downloaded' => $this->torrent->size * 2, // impossible — data sanity violation
-            'left' => 0,
+            'left' => $this->torrent->size * 2, // impossible: a data anomaly
         ]));
 
         $antiCheat = app(AntiCheatService::class);

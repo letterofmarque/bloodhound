@@ -11,6 +11,7 @@ use Marque\Bloodhound\Models\TorrentUser;
 use Marque\Bloodhound\Services\LedgerAggregator;
 use Marque\Bloodhound\Tests\CustomPathTestCase;
 use Marque\Bloodhound\Tests\CustomPatternTestCase;
+use Marque\Bloodhound\Tests\OutsideTransactionTestCase;
 use Marque\Bloodhound\Tests\QueryKeyTestCase;
 use Marque\Bloodhound\Tests\RatioModeFullTestCase;
 use Marque\Bloodhound\Tests\RatioModeOffTestCase;
@@ -43,6 +44,11 @@ pest()->extend(CustomPatternTestCase::class)->in('RoutingPattern');
 pest()->extend(RatioModeFullTestCase::class)->in('StatsFull');
 pest()->extend(RatioModeOffTestCase::class)->in('StatsOff');
 pest()->extend(RatioModeSeedtimeTestCase::class)->in('StatsSeedtime');
+
+// Job #193: tests outside the per-test transaction: ones that migrate the
+// schema themselves (DDL commits on MySQL), and ones that hold a lock from a
+// second connection (which sees only committed rows).
+pest()->extend(OutsideTransactionTestCase::class)->in('UpgradePath', 'Concurrency');
 
 /**
  * Spec #119: the tracker stats contract reports what is stored, in every

@@ -15,8 +15,10 @@ use Marque\Bloodhound\Console\Commands\AggregateLedger;
 use Marque\Bloodhound\Console\Commands\AuditLedger;
 use Marque\Bloodhound\Console\Commands\BackfillLedger;
 use Marque\Bloodhound\Console\Commands\CheckRedis;
+use Marque\Bloodhound\Console\Commands\EnforceRatio;
 use Marque\Bloodhound\Console\Commands\IssueAnnounceKeys;
 use Marque\Bloodhound\Console\Commands\ManageSeedboxes;
+use Marque\Bloodhound\Console\Commands\ManageStanding;
 use Marque\Bloodhound\Console\Commands\PruneAnnounceLog;
 use Marque\Bloodhound\Console\Commands\RebuildTotals;
 use Marque\Bloodhound\Console\Commands\ReconcileLedger;
@@ -33,6 +35,7 @@ use Marque\Bloodhound\Services\AnnounceLogService;
 use Marque\Bloodhound\Services\AnnounceService;
 use Marque\Bloodhound\Services\AntiCheatService;
 use Marque\Bloodhound\Services\ClientValidationService;
+use Marque\Bloodhound\Services\RatioDownloadGate;
 use Marque\Bloodhound\Services\RedisDurability;
 use Marque\Bloodhound\Services\Seedboxes;
 use Marque\Bloodhound\Services\TorrentFilePolicy;
@@ -40,6 +43,7 @@ use Marque\Bloodhound\Services\TrackerSessions;
 use Marque\Bloodhound\Services\TrackerStatsService;
 use Marque\Bloodhound\Support\PeerIdColumn;
 use Marque\Threepio\Services\PeerService;
+use Marque\Trove\Contracts\DownloadGateInterface;
 use Marque\Trove\Contracts\SeedboxesInterface;
 use Marque\Trove\Contracts\TorrentFilePolicyInterface;
 use Marque\Trove\Contracts\TrackerSessionsInterface;
@@ -71,6 +75,11 @@ class BloodhoundServiceProvider extends ServiceProvider
         // What downloads and uploads need from this tracker (#10947): the
         // member's keyed announce URL, and private torrents by default.
         $this->app->singleton(TorrentFilePolicyInterface::class, TorrentFilePolicy::class);
+
+        // The ratio rule's half of downloads (#10732): no .torrent for a member
+        // whose downloading is paused, for a torrent they aren't already in.
+        // Bound in every ratio_mode; with enforcement off it refuses nobody.
+        $this->app->singleton(DownloadGateInterface::class, RatioDownloadGate::class);
 
         // Members' seedboxes (Job #193): one store, two faces. trove's
         // SeedboxesInterface is what a frontend manages them through;
@@ -303,8 +312,10 @@ class BloodhoundServiceProvider extends ServiceProvider
             AuditLedger::class,
             BackfillLedger::class,
             CheckRedis::class,
+            EnforceRatio::class,
             IssueAnnounceKeys::class,
             ManageSeedboxes::class,
+            ManageStanding::class,
             PruneAnnounceLog::class,
             RebuildTotals::class,
             RecordPrunedHistory::class,
@@ -330,5 +341,10 @@ class BloodhoundServiceProvider extends ServiceProvider
         // permanent-and-invisible into something an operator is told about,
         // so it runs unconditionally rather than being something to enable.
         Schedule::command('bloodhound:reconcile-ledger')->daily();
+
+        // Hourly. The ratio rule is judged from folded totals, which move every
+        // minute, and a restriction lifts here once a member has seeded back
+        // up, so an hour is the longest a recovered member waits (#10732).
+        Schedule::command('bloodhound:enforce-ratio')->hourly()->withoutOverlapping();
     }
 }

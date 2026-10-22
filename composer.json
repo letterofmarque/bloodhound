@@ -32,7 +32,7 @@
     ],
     "require": {
         "php": "^8.3",
-        "marque/trove": "^4.7",
+        "marque/trove": "^4.8",
         "marque/threepio": "^4.0",
         "illuminate/support": "^13.0",
         "illuminate/routing": "^13.0",
@@ -46,6 +46,8 @@
         "laravel/pao": "^1.1"
     },
     "conflict": {
+        "marque/disguise": "<5.3",
+        "marque/guise": "<5.3",
         "marque/usarrs": "<8.0"
     },
     "autoload": {

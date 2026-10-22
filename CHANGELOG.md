@@ -7,6 +7,47 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [Unreleased]
+
+> The ratio is enforced: a member below min_ratio goes on watch, then has new downloading paused until they recover, while seeding never is; and a malformed announce key gets a reason by default.
+
+### Changed (breaking)
+
+- **`min_ratio` is enforced** under `ratio_mode` `full`, the default (#10732). A member
+  below it goes on **ratio watch** for `enforcement.watch_days` (14 by default). The
+  conditions are that they've downloaded at least `enforcement.grace_bytes` (5 GiB) and
+  aren't exempt. If they're still below when the watch runs out, **new downloading is
+  paused** until they recover; seeding never is. Back at or above, the watch or pause clears
+  at the next hourly run. It's judged from the folded totals by `bloodhound:enforce-ratio`,
+  hourly on the scheduler. Upgrading puts every member who is already below on watch at the
+  first run, so tell them first, or set `ratio_mode` to `off`.
+- **`routes.malformed_key` defaults to `failure`.** A malformed key in the path gets a
+  bencoded `Invalid announce key` instead of the router's 404. A published config with no
+  such key gets it too. Set it to `not_found` to keep the 404.
+- **Conflicts with `marque/guise` and `marque/disguise` below 5.3.** Those don't catch a
+  refused download and would answer 500 to a restricted member. Upgrade them together
+  (README, "Upgrading from 8.x to 9.0").
+
+### Added
+
+- **Exemptions:** `enforcement.exempt_role` (moderator by default) and above are never
+  watched. `bloodhound:standing exempt <user> --reason= --by=` exempts one member, with the
+  reason and the admin recorded, and lifts a watch or pause at once. `unexempt` puts them
+  back under the rule, and `show` prints where a member stands.
+- **Events** to notify on: `RatioWatchStarted` (with the deadline), `MemberRestricted` and
+  `StandingRestored` (with what it was before).
+- A `member_standings` table, holding only members on watch, restricted or exempted.
+- **What restricted means.** A leech announce (left>0) on a torrent the member isn't
+  already in gets a bencoded failure that names the ratio and the way out, recorded in the
+  ledger like any refusal. Seeding, `stopped`, and a torrent they're already in are answered
+  as normal. "Already in" means a live peer of theirs, or a folded `torrent_user` row. The
+  `.torrent` download is refused the same way, through trove 4.8's `DownloadGateInterface`,
+  which bloodhound binds. A torrent they're already in can be downloaded again. With
+  `ratio_mode` off or `seedtime`, nobody is refused, at once, without waiting for the next
+  run.
+- **`statsFor()` reports the member's standing** (`TrackerStats::$standing`): ok, on watch
+  until a date, restricted, or exempt. Requires `marque/trove ^4.8`.
+
 ## [8.1.0] — 2026-10-21
 
 > What a real upgrade found: a stale published config is reported with the value actually in effect, imported members can be issued keys, a tracker with no scheduler says so, leechtime is reported, and a malformed announce key can get a reason instead of a 404.

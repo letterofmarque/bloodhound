@@ -7,6 +7,48 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [Unreleased]
+
+> Hit-and-run: a torrent downloaded is owed 72 hours of seeding or 1:1 on it; away while short, a pre-warning then a strike; three strikes pause new downloading. Off until you turn it on.
+
+### Added
+
+- **`torrent_user.last_seen`**: when a member was last seen on a torrent, in unix seconds
+  (Job #256). It's the newest folded ledger row's stamp, kept by the aggregator in the
+  batched write it already makes, and never moved backwards. Rebuild and prune leave it
+  alone, unlike `updated_at`. It isn't backfilled; a row without it is set by its next
+  fold.
+- **Hit-and-run** (Job #256, the rest of #10732):
+  - **The obligation.** A torrent a member downloaded more than `hit_and_run.buffer_percent`
+    (10%) of is owed `min_seedtime` (72 hours) of seeding, or a ratio of `hit_and_run.ratio`
+    (1.0) on it, whichever comes first.
+  - **Warning and strike.** Away from it while short (no live peer of theirs on it, last seen
+    `prewarn_days` ago), they're pre-warned. Still away at `grace_days` (3), they get a
+    strike, which lapses after `expire_days` (14) and clears if they seed it to the
+    requirement. A torrent is struck once, ever.
+  - **When it applies.** Under `ratio_mode` `seedtime`, or `full` with `hit_and_run.enabled`.
+    It's off by default, so an upgraded tracker is unchanged.
+  - **Not retroactive.** It counts only activity after it is first switched on.
+  - **Exemptions.** The ratio rule's exemptions apply.
+  - **Running it.** `bloodhound:enforce-hit-and-run` runs hourly. Events:
+    `HitAndRunPrewarned`, `HitAndRunStrike`, `HitAndRunCleared`.
+  - **Defaults** are UNIT3D's mechanics, with 72 hours of seeding rather than its 7 days.
+- `min_seedtime` is read now. Its default is 72 hours (was 24, never read). **A published config still holding 86400 enforces 24 hours** once hit-and-run is on: change it if you meant 72.
+- **One restricted standing for both rules.** `hit_and_run.max_strikes` (3) active strikes
+  pause new downloading at once, through the same announce refusal and download gate as the
+  ratio rule. A member restricted by both stays restricted until both clear. If strikes
+  clear during a ratio watch, the watch resumes with its own deadline. The reason
+  (`statsFor()`, announce, download) names whichever applies. A restriction no rule
+  explains any more, after a mode switched off or a ratio back up, stops being refused at
+  once, not at the next run. `MemberRestricted` gains `strikes` (0 when it was the ratio
+  alone).
+- `bloodhound:enforce-hit-and-run` runs just before `bloodhound:enforce-ratio` each hour,
+  so a new strike restricts in the same run.
+- **trove's `SeedingObligationsInterface`**, bound always. It lists what a member still
+  owes seeding on: strikes first, with when each lapses, then pre-warnings, then the rest,
+  each with seeded and required time and the ratio. The list is empty when hit-and-run is
+  off or the member is exempt. Requires `marque/trove ^4.9`.
+
 ## [9.0.0] — 2026-10-22
 
 > The ratio is enforced: a member below min_ratio goes on watch, then has new downloading paused until they recover, while seeding never is; and a malformed announce key gets a reason by default.

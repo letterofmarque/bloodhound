@@ -15,6 +15,7 @@ use Marque\Bloodhound\Console\Commands\AggregateLedger;
 use Marque\Bloodhound\Console\Commands\AuditLedger;
 use Marque\Bloodhound\Console\Commands\BackfillLedger;
 use Marque\Bloodhound\Console\Commands\CheckRedis;
+use Marque\Bloodhound\Console\Commands\EnforceHitAndRun;
 use Marque\Bloodhound\Console\Commands\EnforceRatio;
 use Marque\Bloodhound\Console\Commands\IssueAnnounceKeys;
 use Marque\Bloodhound\Console\Commands\ManageSeedboxes;
@@ -38,6 +39,7 @@ use Marque\Bloodhound\Services\ClientValidationService;
 use Marque\Bloodhound\Services\RatioDownloadGate;
 use Marque\Bloodhound\Services\RedisDurability;
 use Marque\Bloodhound\Services\Seedboxes;
+use Marque\Bloodhound\Services\SeedingObligations;
 use Marque\Bloodhound\Services\TorrentFilePolicy;
 use Marque\Bloodhound\Services\TrackerSessions;
 use Marque\Bloodhound\Services\TrackerStatsService;
@@ -45,6 +47,7 @@ use Marque\Bloodhound\Support\PeerIdColumn;
 use Marque\Threepio\Services\PeerService;
 use Marque\Trove\Contracts\DownloadGateInterface;
 use Marque\Trove\Contracts\SeedboxesInterface;
+use Marque\Trove\Contracts\SeedingObligationsInterface;
 use Marque\Trove\Contracts\TorrentFilePolicyInterface;
 use Marque\Trove\Contracts\TrackerSessionsInterface;
 use Marque\Trove\Contracts\TrackerStatsInterface;
@@ -80,6 +83,10 @@ class BloodhoundServiceProvider extends ServiceProvider
         // whose downloading is paused, for a torrent they aren't already in.
         // Bound in every ratio_mode; with enforcement off it refuses nobody.
         $this->app->singleton(DownloadGateInterface::class, RatioDownloadGate::class);
+
+        // A member's seeding obligations under hit-and-run (Job #256), for a
+        // frontend to show. Bound always; an empty list when the rule is off.
+        $this->app->singleton(SeedingObligationsInterface::class, SeedingObligations::class);
 
         // Members' seedboxes (Job #193): one store, two faces. trove's
         // SeedboxesInterface is what a frontend manages them through;
@@ -312,6 +319,7 @@ class BloodhoundServiceProvider extends ServiceProvider
             AuditLedger::class,
             BackfillLedger::class,
             CheckRedis::class,
+            EnforceHitAndRun::class,
             EnforceRatio::class,
             IssueAnnounceKeys::class,
             ManageSeedboxes::class,
@@ -341,6 +349,12 @@ class BloodhoundServiceProvider extends ServiceProvider
         // permanent-and-invisible into something an operator is told about,
         // so it runs unconditionally rather than being something to enable.
         Schedule::command('bloodhound:reconcile-ledger')->daily();
+
+        // Hourly, and before enforce-ratio: its strikes feed the restricted
+        // standing that enforce-ratio decides, and commands due in the same
+        // minute run in the order they are defined, so a strike counts at once
+        // rather than an hour later (Job #256).
+        Schedule::command('bloodhound:enforce-hit-and-run')->hourly()->withoutOverlapping();
 
         // Hourly. The ratio rule is judged from folded totals, which move every
         // minute, and a restriction lifts here once a member has seeded back

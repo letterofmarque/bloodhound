@@ -6,9 +6,11 @@ namespace Marque\Bloodhound\Services;
 
 use Illuminate\Redis\Connections\Connection;
 use Illuminate\Support\Facades\Redis;
+use Marque\Bloodhound\Contracts\LocationJudge;
 use Marque\Bloodhound\Contracts\SeedboxRegistry;
 use Marque\Bloodhound\Events\CheatDetected;
-use Marque\Bloodhound\Support\Location;
+use Marque\Bloodhound\Support\LocationQuestion;
+use Marque\Bloodhound\Support\LocationVerdict;
 use Marque\Threepio\Services\PeerService;
 use Marque\Threepio\Support\PeerLookup;
 
@@ -33,19 +35,28 @@ use Marque\Threepio\Support\PeerLookup;
  */
 final class AntiCheatService
 {
+    /**
+     * How an ambiguous location's ledger row reason begins, under `flag`.
+     * The detector finds them by it.
+     */
+    public const AMBIGUOUS_LOCATION = 'Ambiguous location';
+
     public function __construct(
         private readonly PeerService $peerService,
         private readonly SeedboxRegistry $seedboxes,
+        private readonly LocationJudge $locations,
     ) {}
 
     /**
      * Run all anti-cheat checks on an announce request.
      *
      * `forfeit_upload` / `forfeit_download` mark a direction whose bytes are
-     * not credited; `reason` says why, for the ledger row.
+     * not credited; `reason` says why, for the ledger row. `flag` is a reason
+     * to flag the row of an announce that passed and is credited in full (an
+     * ambiguous location under `flag`).
      *
      * @param  array<string, array<string, mixed>>  $livePeers  the torrent's live peers, as PeerService::livePeers() returns them
-     * @return array{passed: bool, reason: ?string, forfeit_upload: bool, forfeit_download: bool}
+     * @return array{passed: bool, reason: ?string, forfeit_upload: bool, forfeit_download: bool, flag: ?string}
      */
     public function check(
         int $torrentId,
@@ -61,7 +72,7 @@ final class AntiCheatService
         PeerLookup $lookup,
         array $livePeers,
     ): array {
-        $pass = ['passed' => true, 'reason' => null, 'forfeit_upload' => false, 'forfeit_download' => false];
+        $pass = ['passed' => true, 'reason' => null, 'forfeit_upload' => false, 'forfeit_download' => false, 'flag' => null];
 
         if (! config('bloodhound.anti_cheat.enabled', true)) {
             return $pass;
@@ -80,6 +91,20 @@ final class AntiCheatService
         $limitCheck = $this->checkLocationLimits($userId, $peerId, $ip, $left, $event, $lookup, $livePeers);
         if (! $limitCheck['passed']) {
             return $limitCheck + $pass;
+        }
+
+        if (($limitCheck['flag'] ?? null) !== null) {
+            $pass['flag'] = $limitCheck['flag'];
+
+            // Every such row is flagged, for the detector. The event fires
+            // once a day per peer: a dual-stack household is ambiguous on
+            // every announce over its second family, and an event each time
+            // would bury everything else staff are shown.
+            $once = $this->prefix().'ambiguous:'.$torrentId.':'.bin2hex($peerId);
+
+            if ($this->redis()->set($once, 1, 'EX', 86_400, 'NX')) {
+                $this->dispatchCheatEvent('location_ambiguous', $userId, $torrentId, $limitCheck['flag']);
+            }
         }
 
         // More left than the torrent holds is impossible, but trove's size
@@ -165,18 +190,16 @@ final class AntiCheatService
      * Refuse a new location past the member's limit on this torrent, or a
      * new client past their limit on it.
      *
-     * A peer already in the swarm, announcing from where it was in the state
-     * it was in, is never refused by a count: the count used to include the
-     * announcing peer, so a member at the limit was refused on every announce
-     * from every client (F6). It is counted again, without itself, when it
-     * moves: to another location, or from seeding to leeching (starting as a
-     * seeder and then reporting bytes left was a way round the leeching
-     * limit). A location is an IP (an IPv6 /64), so a second client at a
-     * location the member already uses is not a new one. Seeding and
-     * leeching are limited separately: the leeching limit is what stops one
-     * account being shared to download.
+     * Where a peer is, and whether that keeps the member within their limit,
+     * is the LocationJudge's question (DefaultLocationJudge unless the app
+     * binds its own). The client count is asked here.
+     *
+     * An ambiguous verdict goes to `anti_cheat.ambiguous_locations`: `refuse`
+     * refuses it, `allow` passes it, and `flag` (the default, and what any
+     * other value means) passes it with a `flag` reason for the ledger row.
      *
      * @param  array<string, array<string, mixed>>  $livePeers
+     * @return array{passed: bool, reason: ?string, flag?: ?string}
      */
     public function checkLocationLimits(int $userId, string $peerId, string $ip, int $left, ?string $event, PeerLookup $lookup, array $livePeers): array
     {
@@ -184,54 +207,25 @@ final class AntiCheatService
             return ['passed' => true, 'reason' => null];
         }
 
-        $location = Location::of($ip);
-        $seeding = $left === 0;
+        $verdict = $this->locations->judge(new LocationQuestion($userId, $peerId, $ip, $left, $lookup, $livePeers));
+
+        $flag = null;
+
+        if ($verdict->kind === LocationVerdict::AMBIGUOUS) {
+            $policy = (string) config('bloodhound.anti_cheat.ambiguous_locations', 'flag');
+
+            if ($policy === 'refuse') {
+                return ['passed' => false, 'reason' => $verdict->reason];
+            }
+
+            if ($policy !== 'allow') {
+                $flag = self::AMBIGUOUS_LOCATION.': moved across address families from a place the member already uses';
+            }
+        } elseif (! $verdict->passed()) {
+            return ['passed' => false, 'reason' => $verdict->reason];
+        }
+
         $record = $lookup->isLive() ? $lookup->baseline : null;
-
-        $moved = $record !== null && Location::of((string) $record['ip']) !== $location;
-        $startedLeeching = $record !== null && (int) $record['left'] === 0 && ! $seeding;
-
-        if ($record !== null && ! $moved && ! $startedLeeching) {
-            return ['passed' => true, 'reason' => null];
-        }
-
-        $locations = [];
-
-        foreach ($livePeers as $otherPeerId => $peer) {
-            if ((string) $otherPeerId === $peerId || ($peer['user_id'] ?? null) !== $userId) {
-                continue;
-            }
-
-            if ((((int) $peer['left']) === 0) !== $seeding) {
-                continue;
-            }
-
-            $peerLocation = Location::of((string) $peer['ip']);
-
-            // Another client of the member, in the same state, already here.
-            if ($peerLocation === $location) {
-                $locations = null;
-
-                break;
-            }
-
-            $locations[$peerLocation] = true;
-        }
-
-        if ($locations !== null) {
-            $kind = $seeding ? 'seeding' : 'leeching';
-            $max = (int) config("bloodhound.anti_cheat.max_{$kind}_locations_per_torrent", $seeding ? 3 : 1);
-
-            if (count($locations) >= $max) {
-                return [
-                    'passed' => false,
-                    // A client restarted somewhere else under a new peer ID
-                    // is the usual way to arrive here, and the member can
-                    // clear the old session rather than wait for it to expire.
-                    'reason' => "Location limit reached ({$max} {$kind} locations per torrent); if a client restarted somewhere else, end the other session from your profile",
-                ];
-            }
-        }
 
         // A new peer: at most max_clients_per_torrent of the member's live
         // peer IDs on this torrent. Many peer IDs on one torrent pollute its
@@ -256,7 +250,7 @@ final class AntiCheatService
             }
         }
 
-        return ['passed' => true, 'reason' => null];
+        return ['passed' => true, 'reason' => null, 'flag' => $flag];
     }
 
     /**

@@ -393,6 +393,26 @@ return [
         'max_seeding_locations_per_torrent' => env('BLOODHOUND_MAX_SEEDING_LOCATIONS', 3),
         'max_leeching_locations_per_torrent' => env('BLOODHOUND_MAX_LEECHING_LOCATIONS', 1),
 
+        // An ambiguous location: a refusal that may be one dual-stack client
+        // announcing over IPv4 and IPv6 in turn (#11133). It is the peer
+        // moving across families, within ambiguous_window seconds of its last
+        // announce, from a place the member already uses. One peer ID
+        // announcing from two places looks the same, so:
+        //   'flag'   accept and credit it, flag the ledger row and fire
+        //            CheatDetected (location_ambiguous); bloodhound:detect-
+        //            location-sharing reports the account sharing pattern
+        //   'refuse' refuse it, as 10.x did (dual-stack households see a
+        //            tracker error on one family)
+        //   'allow'  accept it silently
+        // Anything else means 'flag'.
+        'ambiguous_locations' => env('BLOODHOUND_AMBIGUOUS_LOCATIONS', 'flag'),
+        // Seconds since the peer's last announce, over the other family, for
+        // a refusal to count as ambiguous. At least an announce interval: a
+        // dual-stack client's first family each cycle comes an interval
+        // after its last announce, over the second. Defaults to an hour,
+        // threepio's default peer_expiry.
+        'ambiguous_window' => env('BLOODHOUND_AMBIGUOUS_WINDOW', 3600),
+
         // A member's live clients (peer IDs) on one torrent, counted only for
         // a new one. Many peer IDs on one torrent pollute its swarm; one
         // client per torrent across thousands of torrents is a seedbox doing

@@ -371,6 +371,12 @@ final class AnnounceService
         $seeding = ($credit['prior_left'] ?? $announce->left) === 0;
         $forfeited = $check['forfeit_upload'] || $check['forfeit_download'];
 
+        // A flag on an announce credited in full (an ambiguous location). Its
+        // row always has a baseline (prior_up): an ambiguous verdict needs a
+        // live record, so readers that take "flagged with no baseline" for a
+        // refusal still read it as credited.
+        $reasons = array_filter([$check['flag'] ?? null, $forfeited ? $check['reason'] : null]);
+
         $this->writeRow($announce, [
             'upload_delta' => $check['forfeit_upload'] ? 0 : $credit['upload_delta'],
             'download_delta' => $check['forfeit_download'] ? 0 : $credit['download_delta'],
@@ -379,8 +385,8 @@ final class AnnounceService
             'prior_up' => $credit['prior_up'],
             'prior_down' => $credit['prior_down'],
             'prior_at' => $credit['prior_at'] !== null ? $this->at($credit['prior_at']) : null,
-            'anti_cheat_flagged' => $forfeited,
-            'anti_cheat_reason' => $forfeited ? $check['reason'] : null,
+            'anti_cheat_flagged' => $reasons !== [],
+            'anti_cheat_reason' => $reasons !== [] ? implode('; ', $reasons) : null,
             'created_at' => $this->at($credit['measured_at']),
         ]);
     }
@@ -426,7 +432,26 @@ final class AnnounceService
             'uploaded' => $announce->uploaded,
             'downloaded' => $announce->downloaded,
             'left' => $announce->left,
-        ] + $outcome)->save();
+        ] + $this->fitReason($outcome))->save();
+    }
+
+    /**
+     * The reason column holds 255 characters, and a reason can be longer: a
+     * bound LocationJudge writes its own, and a flag can sit beside a
+     * forfeit in both directions. Cut to fit rather than fail the announce,
+     * which on every engine but SQLite is an error. A flag comes first, so
+     * the prefix the detector reads survives.
+     *
+     * @param  array<string, mixed>  $outcome
+     * @return array<string, mixed>
+     */
+    private function fitReason(array $outcome): array
+    {
+        if (is_string($outcome['anti_cheat_reason'] ?? null)) {
+            $outcome['anti_cheat_reason'] = mb_substr($outcome['anti_cheat_reason'], 0, 255);
+        }
+
+        return $outcome;
     }
 
     /**

@@ -15,6 +15,7 @@ use Marque\Bloodhound\Console\Commands\AggregateLedger;
 use Marque\Bloodhound\Console\Commands\AuditLedger;
 use Marque\Bloodhound\Console\Commands\BackfillLedger;
 use Marque\Bloodhound\Console\Commands\CheckRedis;
+use Marque\Bloodhound\Console\Commands\DetectLocationSharing;
 use Marque\Bloodhound\Console\Commands\EnforceHitAndRun;
 use Marque\Bloodhound\Console\Commands\EnforceRatio;
 use Marque\Bloodhound\Console\Commands\IssueAnnounceKeys;
@@ -26,6 +27,7 @@ use Marque\Bloodhound\Console\Commands\ReconcileLedger;
 use Marque\Bloodhound\Console\Commands\RecordPrunedHistory;
 use Marque\Bloodhound\Console\Commands\SyncSwarmCounts;
 use Marque\Bloodhound\Contracts\AnnounceLogServiceInterface;
+use Marque\Bloodhound\Contracts\LocationJudge;
 use Marque\Bloodhound\Contracts\SeedboxRegistry;
 use Marque\Bloodhound\Events\TorrentCompleted;
 use Marque\Bloodhound\Exceptions\RemovedConfiguration;
@@ -44,6 +46,7 @@ use Marque\Bloodhound\Services\SeedingObligations;
 use Marque\Bloodhound\Services\TorrentFilePolicy;
 use Marque\Bloodhound\Services\TrackerSessions;
 use Marque\Bloodhound\Services\TrackerStatsService;
+use Marque\Bloodhound\Support\DefaultLocationJudge;
 use Marque\Bloodhound\Support\PeerIdColumn;
 use Marque\Threepio\Services\PeerService;
 use Marque\Trove\Contracts\DownloadGateInterface;
@@ -96,6 +99,10 @@ class BloodhoundServiceProvider extends ServiceProvider
         $this->app->singleton(Seedboxes::class);
         $this->app->singleton(SeedboxesInterface::class, fn ($app) => $app->make(Seedboxes::class));
         $this->app->singleton(SeedboxRegistry::class, fn ($app) => $app->make(Seedboxes::class));
+
+        // Where a peer is, for the location limits. Bind your own in an app
+        // service provider to judge by better evidence (ASN, say).
+        $this->app->singleton(LocationJudge::class, DefaultLocationJudge::class);
 
         // A member's live sessions, and ending one (Job #193, D8), for a
         // frontend to show: the leeching limit is only fair with it.
@@ -359,6 +366,7 @@ class BloodhoundServiceProvider extends ServiceProvider
             AuditLedger::class,
             BackfillLedger::class,
             CheckRedis::class,
+            DetectLocationSharing::class,
             EnforceHitAndRun::class,
             EnforceRatio::class,
             IssueAnnounceKeys::class,
@@ -389,6 +397,10 @@ class BloodhoundServiceProvider extends ServiceProvider
         // permanent-and-invisible into something an operator is told about,
         // so it runs unconditionally rather than being something to enable.
         Schedule::command('bloodhound:reconcile-ledger')->daily();
+
+        // Daily, over the last day: account-sharing patterns only the ledger
+        // shows (#11133). Reports and fires events; changes nothing.
+        Schedule::command('bloodhound:detect-location-sharing')->daily();
 
         // Hourly, and before enforce-ratio: its strikes feed the restricted
         // standing that enforce-ratio decides, and commands due in the same

@@ -503,6 +503,17 @@ hold:
   dual-stack machine comes back to a family on its own address, so a new network there is
   a move.
 
+A *new* client's refusal is ambiguous when it lands on another of the member's clients'
+address in that client's other family, and that client was seen on both families within
+`dual_stack_gap` seconds (120). That's an IPv4-only laptop starting beside a dual-stack
+desktop. The desktop's IPv6 announce follows its IPv4 one each cycle, so its place is
+almost always its IPv6 /64, and before 11.1 the laptop was refused on every try. The
+new client's row is flagged ("a new client at another of the member's clients' address")
+and, being new, has no baseline. Ledger readers still count it as accepted: a refusal's
+reason never starts "Ambiguous location". "Lands on" means the same IPv4 address, or the
+same IPv6 /64, and only clients in the same state (both leeching, or both seeding) count.
+`dual_stack_gap` of 0 turns this off.
+
 `ambiguous_locations` says what happens to one:
 
 | Setting | A dual-stack household | One account used at two places |
@@ -516,16 +527,17 @@ per peer per torrent: a household is ambiguous on every announce over its second
 and an event each time would bury everything else. Anything other than the three values
 means `flag`.
 
-One household case is still refused under every setting. A *new* client whose first
-announce arrives over a family the member's other client isn't on has no record to link
-it to anything. For example, an IPv4-only laptop starting while the dual-stack desktop
-has so far announced only over IPv6. It's refused until the two share a family: either
-its own announce over the other family (a dual-stack client sends one at the same moment,
-and its next announce over the first is then ambiguous), or the other client's next
-announce over this one, which libtorrent sends within seconds. Under `flag` and `allow`
-it clears on its own that way. Treating that
-first one as ambiguous too would let a new client claim a place an attacker's peer ID had
-merely passed through.
+Some household cases are still refused under every setting:
+
+- **A dual-stack desktop that has so far announced only over IPv6** has no IPv4 address to
+  pair, so an IPv4-only laptop starting then is a new location. It clears at the desktop's
+  first IPv4 announce, which libtorrent sends within seconds. A desktop client that only
+  ever announces over IPv6 never pairs, and the laptop stays refused.
+- **A desktop whose two families were last seen more than `dual_stack_gap` apart**, such
+  as one endpoint failing and backing off. The laptop clears once both announce close
+  together again.
+- **A dual-stack laptop starting over IPv6** in the few seconds between the desktop's IPv4
+  and IPv6 announces. It clears on its next try.
 
 **What `flag` lets through, and what the detector can see.** Under `flag`, a refusal that
 might be a household is accepted, and the flagged row and its event are the trace. Staff
@@ -556,12 +568,18 @@ What it can't see, because nothing on a tracker can tell these from a real house
 - **A linking peer that settles at the far place**, with no other client of the member
   there. It looks like a dual-stack client whose IPv4 went away. Its setup row is still
   flagged.
+- **A new client at a paired address.** One peer ID announces from two places within
+  `dual_stack_gap` seconds, or a client claims the other address with `ipv4=`/`ipv6=`,
+  and then a new client joins at that address. It looks like a laptop beside a
+  dual-stack desktop. The new client's first row is flagged, and nothing links it to a
+  second place afterwards. (Under `refuse` it's refused.)
 
 It can also report a real household: one whose dual-stack client switched fewer than
 three times after linking the places before it stopped or restarted, while the member
 has other clients at both.
 
-An address a client announces (`ipv4=`, `ipv6=`) never counts toward any of this. If
+An address a client announces (`ipv4=`, `ipv6=`) never counts as a place. It can make a
+new client's refusal ambiguous (see "A new client at a paired address"). If
 none of that suits, take announces over one family only (`address_families`). Or judge
 locations yourself: bind your own `Marque\Bloodhound\Contracts\LocationJudge` in a
 service provider. It's asked a `LocationQuestion` (the member, the peer, its record, the
@@ -917,6 +935,7 @@ per second.
 | `anti_cheat.max_leeching_locations_per_torrent` | `1` | Locations a member may leech one torrent from |
 | `anti_cheat.ambiguous_locations` | `flag` | `flag`, `refuse` or `allow` an [ambiguous location](#anti-cheat) (`BLOODHOUND_AMBIGUOUS_LOCATIONS`) |
 | `anti_cheat.ambiguous_window` | `3600` | Seconds since the peer's last announce, over the other family, for a refusal to be ambiguous (`BLOODHOUND_AMBIGUOUS_WINDOW`) |
+| `anti_cheat.dual_stack_gap` | `120` | Seconds between a client's IPv4 and IPv6 announces for a new client at its other address to be ambiguous; an announced (`ipv4=`/`ipv6=`) address always counts; `0` turns it off (`BLOODHOUND_DUAL_STACK_GAP`) |
 | `anti_cheat.max_clients_per_torrent` | `5` | A member's live clients (peer IDs) on one torrent; only a new one is refused |
 | `anti_cheat.block_datacenter_ips` | `false` | Not built yet; setting it does nothing <!-- check-docs: ignore — never built, needs a design decision first (#10813) --> |
 
@@ -1224,8 +1243,9 @@ This is a Bloodhound feature and has no equivalent in [marque/hound](https://pac
 
 One change in default behaviour, which is why it's a major: an ambiguous location is
 accepted and flagged (`ambiguous_locations=flag`) instead of refused. A dual-stack client
-is no longer refused for switching families. A new client starting over the other family
-is still refused once (see [Ambiguous locations](#anti-cheat)). To keep 10.x's refusals,
+is no longer refused for switching families. From 11.1, a new client at another client's
+paired address is ambiguous too; see [Ambiguous locations](#anti-cheat) for the cases
+still refused. To keep 10.x's refusals,
 set `BLOODHOUND_AMBIGUOUS_LOCATIONS=refuse`; the detector still runs and reports either
 way.
 

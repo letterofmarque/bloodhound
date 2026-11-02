@@ -7,6 +7,32 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [11.1.0] — 2026-11-02
+
+> An IPv4-only client beside a dual-stack one is no longer locked out: under flag it's an ambiguous location, flagged, instead of refused on every try.
+
+### Fixed
+
+- **An IPv4-only client starting beside a dual-stack one was refused for good** (found
+  by Job #319's independent check). The dual-stack client announces over IPv4 and then
+  IPv6 each cycle, so its place is almost always its IPv6 /64. The new client never got
+  a record and was judged a new location on every try. 11.0.0's README said this cleared
+  on its own; it didn't. A new client is now ambiguous when it lands on another client's
+  other-family address and that client was seen on both families within
+  `anti_cheat.dual_stack_gap` seconds (120). Under `flag` that's accepted and flagged
+  with its own reason; under `refuse` it's refused as before. Its row has no baseline,
+  because the client is new, and the ledger's readers (Redis-loss recovery, the audit,
+  the detector) still count it as accepted: `AnnounceLog::refused()` and the `accepted()`
+  scope are the one definition of a refusal now. A refusal's reason never starts
+  "Ambiguous location"; a bound judge's that would is recorded as "Refused: …".
+
+### Added
+
+- **`anti_cheat.dual_stack_gap`** (`BLOODHOUND_DUAL_STACK_GAP`, 120). An announced address
+  always counts; 0 turns pairing off.
+- **`AnnounceLog::refused()`, `wasRefused()` and the `accepted()` scope**: whether a
+  ledger row was a refusal.
+
 ## [11.0.0] — 2026-11-02
 
 > Dual-stack clients aren't refused for switching families: an ambiguous location is flagged by default, a daily detector reports two account-sharing patterns, and locations can be judged by your own LocationJudge.

@@ -11,9 +11,12 @@ declare(strict_types=1);
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Redis;
+use Marque\Bloodhound\Contracts\LocationJudge;
 use Marque\Bloodhound\Events\CheatDetected;
 use Marque\Bloodhound\Models\AnnounceLog;
 use Marque\Bloodhound\Services\AntiCheatService;
+use Marque\Bloodhound\Support\LocationQuestion;
+use Marque\Bloodhound\Support\LocationVerdict;
 use Marque\Bloodhound\Tests\TestUser;
 use Marque\Threepio\Http\Middleware\BlockBrowsers;
 use Marque\Threepio\Support\Bencode;
@@ -122,24 +125,88 @@ describe('flag (the default)', function () {
     });
 });
 
-// Documented, not fixed: making it ambiguous would let a new client match the
-// other-family address an attacker's peer ID left behind (Sequence B).
-test('a new client whose first announce comes over the other family is refused once, then ambiguous', function () {
-    ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 0);
+// Found by the 11.0 independent check: the desktop announces over IPv4 and
+// then IPv6 each cycle, so at almost any moment its place is its IPv6 /64,
+// and an IPv4-only laptop starting later was refused for good, never getting
+// a record. The laptop now lands on the desktop's paired IPv4 address.
+test('an IPv4-only client starting beside a dual-stack one is not locked out', function () {
+    foreach (range(0, 3) as $i) {
+        ambiguous($this, '-qB4210-desktop00000', '203.0.113.7', $i * 1_800, $i === 0 ? [] : ['event' => '']);
+        ambiguous($this, '-qB4210-desktop00000', '2001:db8:1:2::10', $i * 1_800 + 5, ['event' => '']);
+    }
 
-    expect(ambiguous($this, '-qB4210-desktop00000', '2001:db8:1:2::10', 10))->toHaveKey('failure reason')
-        ->and(ambiguous($this, '-qB4210-desktop00000', '203.0.113.7', 11))->not->toHaveKey('failure reason')
-        ->and(ambiguous($this, '-qB4210-desktop00000', '2001:db8:1:2::10', 70, ['event' => '']))->not->toHaveKey('failure reason');
+    expect(ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 3 * 1_800 + 600))->not->toHaveKey('failure reason')
+        ->and(lastRowOf('-qB4210-laptop000000')->anti_cheat_reason)->toStartWith(AntiCheatService::AMBIGUOUS_LOCATION)
+        ->and(ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 3 * 1_800 + 2_400, ['event' => '']))->not->toHaveKey('failure reason');
 });
 
-test('an IPv4-only client starting while the dual-stack one has only used IPv6 is refused until that one announces over IPv4', function () {
-    ambiguous($this, '-qB4210-desktop00000', '2001:db8:1:2::10', 0);
+// Found by the 11.1 review: the admitted laptop's row is flagged and, being
+// new, has no baseline, which every ledger reader took for a refusal.
+test('an admitted new client is an accepted row: its own reason, read by recovery and the audit', function () {
+    ambiguous($this, '-qB4210-desktop00000', '203.0.113.7', 0);
+    ambiguous($this, '-qB4210-desktop00000', '2001:db8:1:2::10', 5, ['event' => '']);
+    ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 600, ['downloaded' => 1_000]);
 
-    expect(ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 5))->toHaveKey('failure reason');
+    $row = lastRowOf('-qB4210-laptop000000');
 
-    ambiguous($this, '-qB4210-desktop00000', '203.0.113.7', 10, ['event' => '']);
+    expect($row->prior_up)->toBeNull()
+        ->and($row->wasRefused())->toBeFalse()
+        ->and($row->anti_cheat_reason)->toContain('a new client')
+        ->and(AnnounceLog::query()->accepted()->whereKey($row->id)->exists())->toBeTrue();
 
-    expect(ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 15))->not->toHaveKey('failure reason');
+    // Redis loses the laptop: its next announce is credited from that row.
+    Redis::connection(config('threepio.redis.connection', 'default'))->flushdb();
+    ambiguous($this, '-qB4210-desktop00000', '203.0.113.7', 1_800, ['event' => '']);
+    ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 2_400, ['event' => '', 'downloaded' => 4_000]);
+
+    expect(lastRowOf('-qB4210-laptop000000')->download_delta)->toBe(3_000);
+
+    $this->artisan('bloodhound:audit-ledger')->assertSuccessful();
+});
+
+test('a refusal never carries the accepted-ambiguous marker in the ledger, whatever a judge writes', function () {
+    app()->forgetInstance(AntiCheatService::class);
+    app()->instance(LocationJudge::class, new class implements LocationJudge
+    {
+        public function judge(LocationQuestion $question): LocationVerdict
+        {
+            return LocationVerdict::refuse(AntiCheatService::AMBIGUOUS_LOCATION.': by ASN');
+        }
+    });
+
+    expect(ambiguous($this, '-qB4210-aaaaaaaaaaaa', '203.0.113.7', 0)['failure reason'])->toBe('Ambiguous location: by ASN');
+
+    $row = lastRowOf('-qB4210-aaaaaaaaaaaa');
+
+    expect($row->anti_cheat_reason)->toBe('Refused: Ambiguous location: by ASN')
+        ->and($row->wasRefused())->toBeTrue();
+});
+
+test('dual_stack_gap 0 turns pairing off, claims included', function () {
+    config(['bloodhound.anti_cheat.dual_stack_gap' => 0]);
+
+    ambiguous($this, '-qB4210-desktop00000', '203.0.113.7', 0);
+    ambiguous($this, '-qB4210-desktop00000', '2001:db8:1:2::10', 5, ['event' => '']);
+    ambiguous($this, '-qB4210-friend000000', '198.51.100.9', 10, ['ipv6' => '2001:db8:9::1']);
+
+    expect(ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 600))->toHaveKey('failure reason')
+        ->and(ambiguous($this, '-qB4210-friend222222', '2001:db8:9::2', 610))->toHaveKey('failure reason');
+});
+
+test('the laptop beside a dual-stack client is refused under refuse, as in 10.x', function () {
+    config(['bloodhound.anti_cheat.ambiguous_locations' => 'refuse']);
+
+    ambiguous($this, '-qB4210-desktop00000', '203.0.113.7', 0);
+    ambiguous($this, '-qB4210-desktop00000', '2001:db8:1:2::10', 5, ['event' => '']);
+
+    expect(ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 600))->toHaveKey('failure reason');
+});
+
+test('a client whose two families were seen far apart is no grounds for a new client', function () {
+    ambiguous($this, '-qB4210-desktop00000', '203.0.113.7', 0);
+    ambiguous($this, '-qB4210-desktop00000', '2001:db8:1:2::10', 600, ['event' => '']);
+
+    expect(ambiguous($this, '-qB4210-laptop000000', '203.0.113.7', 700))->toHaveKey('failure reason');
 });
 
 describe('refuse', function () {
@@ -173,13 +240,31 @@ test('a value it doesn\'t know means flag', function () {
 // ambiguous by design passes, which is what allow is for.
 describe('the 2026-11-01 attack sequences', function () {
     // One peer ID, home over IPv4 then a friend's over IPv6; stock clients at both.
-    test('B: one peer ID linking two places, then ordinary clients at each, is refused', function (string $policy) {
+    // Coordinated within dual_stack_gap it looks like a dual-stack client:
+    // refused under refuse, flagged under flag (never silent), and accepted
+    // under allow, which is what allow is for.
+    test('B: one peer ID linking two places within seconds, then a client at home', function (string $policy) {
         config(['bloodhound.anti_cheat.ambiguous_locations' => $policy]);
 
         ambiguous($this, '-qB4210-xxxxxxxxxxxx', '203.0.113.7', 0);
         ambiguous($this, '-qB4210-xxxxxxxxxxxx', '2001:db8:9::1', 30, ['event' => '']);
+        $home = ambiguous($this, '-qB4210-yyyyyyyyyyyy', '203.0.113.7', 60);
 
-        expect(ambiguous($this, '-qB4210-yyyyyyyyyyyy', '203.0.113.7', 60))->toHaveKey('failure reason');
+        match ($policy) {
+            'refuse' => expect($home)->toHaveKey('failure reason'),
+            'flag' => expect($home)->not->toHaveKey('failure reason')
+                ->and(lastRowOf('-qB4210-yyyyyyyyyyyy')->anti_cheat_reason)->toStartWith(AntiCheatService::AMBIGUOUS_LOCATION),
+            'allow' => expect($home)->not->toHaveKey('failure reason'),
+        };
+    })->with(['refuse', 'flag', 'allow']);
+
+    test('B: set up further apart than dual_stack_gap, it is refused', function (string $policy) {
+        config(['bloodhound.anti_cheat.ambiguous_locations' => $policy]);
+
+        ambiguous($this, '-qB4210-xxxxxxxxxxxx', '203.0.113.7', 0);
+        ambiguous($this, '-qB4210-xxxxxxxxxxxx', '2001:db8:9::1', 400, ['event' => '']);
+
+        expect(ambiguous($this, '-qB4210-yyyyyyyyyyyy', '203.0.113.7', 460))->toHaveKey('failure reason');
     })->with(['refuse', 'flag', 'allow']);
 
     // A helper peer at home moves to a friend's over the other family.

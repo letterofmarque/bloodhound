@@ -8,7 +8,7 @@ use BackedEnum;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Routing\Controller;
-use Marque\Bloodhound\Models\AnnounceKey;
+use Marque\Bloodhound\Services\AnnounceKeyProvisioner;
 use Marque\Bloodhound\Services\AnnounceService;
 use Marque\Bloodhound\Support\AnnounceRouting;
 use Marque\Threepio\Support\PeerAddresses;
@@ -36,17 +36,26 @@ class AnnounceController extends Controller
      */
     public function __invoke(Request $request, ?string $announceKey = null): Response
     {
-        $announceKey = AnnounceRouting::keyFromRequest($request, $announceKey);
+        // The endpoint the request came in on (Job #109): its own key source
+        // and pattern, never another endpoint's.
+        $endpoint = AnnounceRouting::forRequest($request);
+
+        // A legacy endpoint's transform reshapes the request first (Job #109);
+        // everything below sees the reshaped one.
+        $request = $endpoint->transform($request);
+        $announceKey = $endpoint->keyFromRequest($request, $announceKey);
 
         // Absent entirely (query mode, parameter missing) or malformed. Both are
         // a bencoded failure with HTTP 200, the shape every other tracker error
         // uses — clients surface the reason rather than reporting a dead tracker.
-        if ($announceKey === null || ! AnnounceRouting::matches($announceKey)) {
+        if ($announceKey === null || ! $endpoint->matches($announceKey)) {
             return TrackerResponse::error('Invalid announce key');
         }
 
-        // Find user by announce key
-        $user = $this->findUserByAnnounceKey($announceKey);
+        // The endpoint's transform finds the member if it can (and may
+        // provision one a migration hasn't brought over yet); otherwise the
+        // native lookup by key. One or the other, never both (Job #109).
+        $user = $endpoint->resolveUser($request) ?? $this->findUserByAnnounceKey($announceKey);
         if ($user === null) {
             return TrackerResponse::error('Unknown announce key');
         }
@@ -203,12 +212,7 @@ class AnnounceController extends Controller
      */
     private function findUserByAnnounceKey(string $announceKey): ?UserInterface
     {
-        $userModel = config('trove.user_model', 'App\\Models\\User');
-        $model = new $userModel;
-
-        return $userModel::query()
-            ->whereIn($model->getKeyName(), AnnounceKey::query()->select('user_id')->where('key', $announceKey))
-            ->first();
+        return app(AnnounceKeyProvisioner::class)->userForKey($announceKey);
     }
 
     /**

@@ -7,6 +7,45 @@ follows the suite's [VERSIONING.md](../../VERSIONING.md). This changelog starts
 2026-08-26 — earlier releases aren't backfilled; see `git log` or
 [docs/upgrading.md](../../docs/upgrading.md) for the story up to this point.
 
+## [11.3.0] — 2026-11-08
+
+> A tracker can serve several announce URLs at once: its native one beside the legacy URL old .torrent files still announce to.
+
+### Added
+
+- **`bloodhound.endpoints`: more announce URLs, served together** (Job #109). A migrating
+  tracker doesn't cut over: .torrent files issued years ago announce to the old URL, new
+  ones to the native one, both at once. `bloodhound.routes` stays the primary endpoint,
+  unchanged, with the route names `tracker.announce` / `tracker.scrape` and the URL new
+  downloads carry. Each entry in `bloodhound.endpoints` takes the same keys (paths, key
+  source, parameter, pattern, `malformed_key`) and is routed as
+  `tracker.announce.<name>` / `tracker.scrape.<name>`. Each endpoint vets keys against its
+  own pattern, and a path-key endpoint gets its own bencoded "Invalid announce key"
+  fallback. Two endpoints sharing a path, or one under the path of an endpoint that takes
+  its key in the path, refuse to boot, naming both, rather than one silently shadowing
+  the other.
+- **An endpoint can name an `AnnounceTransform`** (Job #109): a class, resolved from the
+  container, that reshapes a legacy request (a renamed parameter, a key in another case)
+  into one the native tracker accepts, before announce or scrape handle it. Only a class
+  implementing `Marque\Bloodhound\Contracts\AnnounceTransform` is accepted; a file path or
+  function name refuses to boot, since config naming code to run on the announce URL would
+  be remote code execution. bloodhound reads `info_hash` and `peer_id` from the raw query
+  string, so `ReshapedRequest::withQueryString()` builds the reshaped request with both
+  in step.
+- **Lazy migration: a transform can find the announcing member, and provision one the old
+  tracker knows but Marque doesn't yet** (Job #109). `resolveUser()` replaces the native
+  lookup by key rather than adding to it (one lookup either way); null means "not mine",
+  and the native lookup runs. `AnnounceKeyProvisioner::provision($key, $create)` is how a
+  transform provisions: a key Marque knows returns its member without calling `$create`;
+  for an unknown key `$create` asks the old tracker (the gate) and creates the member, or
+  returns null and nothing is created. The member keeps their old key, so their old
+  .torrent files and the native URL both work. Concurrent first announces with one key
+  produce exactly one member: the losing request rolls back and returns the winner's.
+  `provision()`'s third argument runs once the member is committed, only in the request
+  that created them, which is where a transform carries the member's old figures over with
+  `LedgerAdjuster::adjust()`, on the record, so a ratio-enforcing tracker doesn't restrict
+  members its migration just created.
+
 ## [11.2.0] — 2026-11-07
 
 > Operators can correct a member's totals on the record: accept stored totals the ledger can't explain, or give and take an amount, with who and why.
